@@ -1,0 +1,5 @@
+<RCC>
+  <qresource prefix="/icons">
+    <file alias="ac-linux-manager.svg">ac-linux-manager.svg</file>
+  </qresource>
+</RCC>
