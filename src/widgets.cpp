@@ -38,6 +38,7 @@
 #include <QProgressBar>
 #include <QPainter>
 #include <QPushButton>
+#include <QPixmapCache>
 #include <QScrollArea>
 #include <QSet>
 #include <QSignalBlocker>
@@ -89,9 +90,18 @@ QPixmap pixmapFromUrl(const QString &value, const QSize &size)
     if (path.isEmpty()) {
         return {};
     }
+    const QString cacheKey = path + QStringLiteral("@")
+        + QString::number(size.width()) + QStringLiteral("x") + QString::number(size.height());
+    QPixmap cached;
+    if (QPixmapCache::find(cacheKey, &cached)) {
+        return cached;
+    }
     QPixmap pixmap(path);
-    return pixmap.isNull() ? pixmap
-                           : pixmap.scaled(size, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    if (!pixmap.isNull()) {
+        pixmap = pixmap.scaled(size, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+        QPixmapCache::insert(cacheKey, pixmap);
+    }
+    return pixmap;
 }
 
 QString humanizeTrackId(QString id)
@@ -162,6 +172,9 @@ public:
         poll_.setInterval(200);
         connect(&poll_, &QTimer::timeout, this, [this] { refresh(); });
         poll_.start();
+        racePoll_.setInterval(1000);
+        connect(&racePoll_, &QTimer::timeout, this, [this] { invoke(backend_, "refreshRaceState"); });
+        racePoll_.start();
         applyTimer_.setSingleShot(true);
         applyTimer_.setInterval(220);
         connect(&applyTimer_, &QTimer::timeout, this, [this] { applyDrive(); });
@@ -183,6 +196,7 @@ private:
         QLabel *details{};
         QComboBox *layouts{};
         QPushButton *favorite{};
+        QPushButton *dashboard{};
         QPushButton *use{};
         QJsonObject selected;
         bool cars{};
@@ -205,22 +219,22 @@ private:
         auto *refreshAction = new QAction(QIcon::fromTheme("view-refresh"), tr("Refresh"), this);
         refreshAction->setShortcut(QKeySequence::Refresh);
         connect(refreshAction, &QAction::triggered, this, [this] { invoke(backend_, "discover"); });
-        auto *driveAction = new QAction(QIcon::fromTheme("media-playback-start"), tr("Drive"), this);
-        driveAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+G")));
-        connect(driveAction, &QAction::triggered, this,
-                [this] { invoke(backend_, "launchExistingSession"); });
+        driveAction_ = new QAction(QIcon::fromTheme("media-playback-start"), tr("Drive"), this);
+        driveAction_->setShortcut(QKeySequence(QStringLiteral("Ctrl+G")));
+        connect(driveAction_, &QAction::triggered, this,
+                [this] { launchDrive(); });
         auto *toolbar = addToolBar(tr("Main"));
         toolbar->setMovable(false);
         toolbar->setIconSize(QSize(18, 18));
         toolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
         toolbar->addAction(refreshAction);
-        toolbar->addAction(driveAction);
+        toolbar->addAction(driveAction_);
         toolbar->hide();
         menuBar()->addMenu(tr("File"))->addAction(refreshAction);
-        menuBar()->addMenu(tr("Session"))->addAction(driveAction);
+        menuBar()->addMenu(tr("Session"))->addAction(driveAction_);
         menuBar()->hide();
         addAction(refreshAction);
-        addAction(driveAction);
+        addAction(driveAction_);
         auto *toggleMenu = new QShortcut(QKeySequence(QStringLiteral("Ctrl+M")), this);
         connect(toggleMenu, &QShortcut::activated, this, [this] { menuBar()->setVisible(!menuBar()->isVisible()); });
 
@@ -301,6 +315,12 @@ private:
         carPreview_->setIconSize(QSize(360, 155));
         connect(carPreview_, &QToolButton::clicked, this, [this] { navigation_->setCurrentRow(1); });
         carColumn->addWidget(carPreview_);
+        auto *carVariantLabel = new QLabel(tr("Car variant"));
+        carVariantLabel->setBuddy(carVariant_ = new QComboBox);
+        carVariant_->setIconSize(QSize(144, 81));
+        carVariant_->setMinimumHeight(88);
+        carColumn->addWidget(carVariantLabel);
+        carColumn->addWidget(carVariant_);
         auto *skinLabel = new QLabel(tr("Car livery"));
         skinLabel->setBuddy(skin_ = new QComboBox);
         skin_->setIconSize(QSize(144, 81));
@@ -336,15 +356,15 @@ private:
         launchSummary_ = new QLabel;
         launchSummary_->setWordWrap(true);
         launchSummary_->setAlignment(Qt::AlignTop | Qt::AlignLeft);
-        auto *launch = new QPushButton(QIcon::fromTheme("media-playback-start"), tr("Drive"));
-        launch->setMinimumHeight(58);
-        QFont launchFont = launch->font(); launchFont.setBold(true); launchFont.setPointSize(launchFont.pointSize() + 2); launch->setFont(launchFont);
-        connect(launch, &QPushButton::clicked, this, [this] { invoke(backend_, "launchExistingSession"); });
+        driveButton_ = new QPushButton(QIcon::fromTheme("media-playback-start"), tr("Drive"));
+        driveButton_->setMinimumHeight(58);
+        QFont launchFont = driveButton_->font(); launchFont.setBold(true); launchFont.setPointSize(launchFont.pointSize() + 2); driveButton_->setFont(launchFont);
+        connect(driveButton_, &QPushButton::clicked, this, [this] { launchDrive(); });
         auto *showroom = new QPushButton(QIcon::fromTheme("applications-graphics"), tr("Showroom"));
         showroom->setMinimumHeight(42);
         connect(showroom, &QPushButton::clicked, this, [this] { invoke(backend_, "launchShowroom"); });
         launchLayout->addWidget(launchSummary_, 1);
-        launchLayout->addWidget(launch);
+        launchLayout->addWidget(driveButton_);
         launchLayout->addWidget(showroom);
         selection->addWidget(launchPanel);
         layout->addLayout(selection);
@@ -390,6 +410,13 @@ private:
 
         for (auto *combo : {mode_, weather_}) connect(combo, &QComboBox::activated, this, [this] { scheduleApply(); });
         connect(skin_, &QComboBox::activated, this, [this] { selectedSkin_ = skin_->currentData().toString(); scheduleApply(); });
+        connect(carVariant_, &QComboBox::activated, this, [this] {
+            const QJsonObject variant = carVariant_->currentData().toJsonObject();
+            if (variant.isEmpty()) return;
+            selectedCar_ = variant.value("id").toString();
+            selectedSkin_ = variant.value("skin").toString();
+            scheduleApply();
+        });
         connect(trackLayout_, &QComboBox::activated, this, [this] {
             const QJsonObject layout = trackLayout_->currentData().toJsonObject();
             if (!layout.isEmpty()) { selectedTrack_ = layout.value("id").toString(); scheduleApply(); }
@@ -485,19 +512,20 @@ private:
         auto *detailTitle = new QLabel;
         QFont detailFont = detailTitle->font(); detailFont.setPointSize(detailFont.pointSize() + 4); detailFont.setBold(true); detailTitle->setFont(detailFont); detailTitle->setWordWrap(true);
         auto *layoutChoice = new QComboBox;
-        layoutChoice->setVisible(!cars);
         auto *detailText = new QLabel;
         detailText->setWordWrap(true);
         detailText->setTextInteractionFlags(Qt::TextSelectableByMouse);
         detailText->setAlignment(Qt::AlignTop | Qt::AlignLeft);
         auto *favorite = new QPushButton(QIcon::fromTheme("rating"), tr("Add Favorite"));
+        auto *dashboard = new QPushButton(QIcon::fromTheme("view-grid"), tr("Add to Dashboard"));
         auto *use = new QPushButton(QIcon::fromTheme("dialog-ok-apply"), cars ? tr("Use This Car") : tr("Use This Track"));
-        use->setEnabled(false); favorite->setEnabled(false);
+        use->setEnabled(false); favorite->setEnabled(false); dashboard->setEnabled(false);
         detailsLayout->addWidget(detailImage);
         detailsLayout->addWidget(detailTitle);
         detailsLayout->addWidget(layoutChoice);
         detailsLayout->addWidget(detailText, 1);
         detailsLayout->addWidget(favorite);
+        detailsLayout->addWidget(dashboard);
         detailsLayout->addWidget(use);
         auto *splitter = new QSplitter;
         splitter->addWidget(list); splitter->addWidget(details); splitter->setStretchFactor(0, 1);
@@ -505,18 +533,23 @@ private:
         layout->addWidget(splitter, 1);
         stack_->addWidget(page);
         CatalogWidgets &catalog = cars ? carCatalog_ : trackCatalog_;
-        catalog = {list, search, filter, sort, favoritesOnly, detailImage, detailTitle, detailText, layoutChoice, favorite, use, {}, cars};
+        catalog = {list, search, filter, sort, favoritesOnly, detailImage, detailTitle, detailText, layoutChoice, favorite, dashboard, use, {}, cars};
         if (cars) { carSearch_ = search; carList_ = list; carCountLabel_ = count; }
         else { trackSearch_ = search; trackList_ = list; trackCountLabel_ = count; }
-        connect(search, &QLineEdit::textChanged, this, [this, cars] { populateCatalog(cars ? carList_ : trackList_, cars ? cars_ : tracks_); });
-        connect(filter, &QComboBox::currentIndexChanged, this, [this, cars] { populateCatalog(cars ? carList_ : trackList_, cars ? cars_ : tracks_); });
-        connect(sort, &QComboBox::currentIndexChanged, this, [this, cars] { populateCatalog(cars ? carList_ : trackList_, cars ? cars_ : tracks_); });
-        connect(favoritesOnly, &QCheckBox::toggled, this, [this, cars] { populateCatalog(cars ? carList_ : trackList_, cars ? cars_ : tracks_); });
-        connect(list, &QListWidget::itemClicked, this, [this, cars](QListWidgetItem *item) { inspectCatalogItem(cars, item->data(Qt::UserRole).toJsonObject()); });
-        connect(list, &QListWidget::itemDoubleClicked, this, [this, cars](QListWidgetItem *item) { inspectCatalogItem(cars, item->data(Qt::UserRole).toJsonObject()); commitCatalogItem(cars); });
-        connect(layoutChoice, &QComboBox::currentIndexChanged, this, [this, cars](int index) { if (!cars && index >= 0) showCatalogDetails(false); });
+        auto *searchTimer = new QTimer(search);
+        searchTimer->setSingleShot(true);
+        searchTimer->setInterval(140);
+        connect(search, &QLineEdit::textChanged, searchTimer, qOverload<>(&QTimer::start));
+        connect(searchTimer, &QTimer::timeout, this, [this, cars] { filterCatalogSearch(cars ? carList_ : trackList_); });
+        connect(filter, &QComboBox::currentIndexChanged, this, [this, cars] { populateCatalog(cars ? carList_ : trackList_); });
+        connect(sort, &QComboBox::currentIndexChanged, this, [this, cars] { populateCatalog(cars ? carList_ : trackList_); });
+        connect(favoritesOnly, &QCheckBox::toggled, this, [this, cars] { populateCatalog(cars ? carList_ : trackList_); });
+        connect(list, &QListWidget::itemClicked, this, [this, cars](QListWidgetItem *item) { inspectCatalogItem(cars, item->data(Qt::UserRole).toJsonObject(), QString()); });
+        connect(list, &QListWidget::itemDoubleClicked, this, [this, cars](QListWidgetItem *item) { inspectCatalogItem(cars, item->data(Qt::UserRole).toJsonObject(), QString()); commitCatalogItem(cars); });
+        connect(layoutChoice, &QComboBox::currentIndexChanged, this, [this, cars](int index) { if (index >= 0) showCatalogDetails(cars); });
         connect(use, &QPushButton::clicked, this, [this, cars] { commitCatalogItem(cars); });
         connect(favorite, &QPushButton::clicked, this, [this, cars] { toggleCatalogFavorite(cars); });
+        connect(dashboard, &QPushButton::clicked, this, [this, cars] { toggleCatalogDashboard(cars); });
     }
 
     void buildRace()
@@ -899,16 +932,47 @@ private:
     void applyDrive()
     {
         if (selectedCar_.isEmpty() || selectedTrack_.isEmpty()) return;
+        const QString json = driveConditionsJson();
+        QMetaObject::invokeMethod(backend_, "applyConfiguration", Q_ARG(QString, selectedCar_), Q_ARG(QString, selectedSkin_), Q_ARG(QString, selectedTrack_), Q_ARG(QString, json));
+    }
+
+    QString driveConditionsJson() const
+    {
         QJsonObject conditions = conditions_;
         conditions["session_mode"] = mode_->currentData().toString(); conditions["opponents"] = opponents_->value(); conditions["ai_level"] = ai_->value(); conditions["race_laps"] = laps_->value(); conditions["session_duration"] = duration_->value(); conditions["penalties"] = penalties_->isChecked(); conditions["weather_id"] = weather_->currentData().toString(); conditions["sun_angle"] = (time_->time().hour() + time_->time().minute() / 60.0 - 13.0) * 16.0; conditions["ambient_temperature"] = air_->value(); conditions["road_temperature"] = road_->value();
-        const QString json = QString::fromUtf8(QJsonDocument(conditions).toJson(QJsonDocument::Compact));
-        QMetaObject::invokeMethod(backend_, "applyConfiguration", Q_ARG(QString, selectedCar_), Q_ARG(QString, selectedSkin_), Q_ARG(QString, selectedTrack_), Q_ARG(QString, json));
+        return QString::fromUtf8(QJsonDocument(conditions).toJson(QJsonDocument::Compact));
+    }
+
+    void launchDrive()
+    {
+        if (boolProperty(backend_, "race_running")) {
+            invoke(backend_, "stopRace");
+            return;
+        }
+        if (selectedCar_.isEmpty() || selectedTrack_.isEmpty()) return;
+        applyTimer_.stop();
+        const QString json = driveConditionsJson();
+        QMetaObject::invokeMethod(backend_, "launchConfiguration", Q_ARG(QString, selectedCar_), Q_ARG(QString, selectedSkin_), Q_ARG(QString, selectedTrack_), Q_ARG(QString, json));
     }
 
     void refresh()
     {
         const bool contentBusy = boolProperty(backend_, "content_busy");
         const bool onlineBusy = boolProperty(backend_, "online_busy");
+        const bool launching = boolProperty(backend_, "launching");
+        const bool raceRunning = boolProperty(backend_, "race_running");
+        if (driveButton_) {
+            driveButton_->setEnabled(!launching);
+            driveButton_->setText(raceRunning ? tr("Stop") : tr("Drive"));
+            driveButton_->setIcon(QIcon::fromTheme(raceRunning ? "media-playback-stop" : "media-playback-start"));
+        }
+        if (driveAction_) {
+            driveAction_->setEnabled(!launching);
+            driveAction_->setText(raceRunning ? tr("Stop") : tr("Drive"));
+            driveAction_->setIcon(QIcon::fromTheme(raceRunning ? "media-playback-stop" : "media-playback-start"));
+        }
+        if (onlineJoin_)
+            onlineJoin_->setEnabled(!launching && onlineTable_->currentRow() >= 0 && onlineCar_->count() > 0);
         statusLabel_->setText(textProperty(backend_, "status")); cspLabel_->setText(textProperty(backend_, "csp_status")); busy_->setVisible(boolProperty(backend_, "scanning") || boolProperty(backend_, "launching") || contentBusy || onlineBusy);
         if (contentCspStatus_) contentCspStatus_->setText(textProperty(backend_, "csp_status"));
         if (contentError_) contentError_->setText(textProperty(backend_, "error_message"));
@@ -918,9 +982,9 @@ private:
         if (launchSummary_) launchSummary_->setText(tr("%1\n\n%2\n\n%3").arg(textProperty(backend_, "car_name"), textProperty(backend_, "track_name"), textProperty(backend_, "csp_status")));
         if (carCountLabel_) carCountLabel_->setText(tr("%1 installed").arg(backend_->property("car_count").toInt()));
         if (trackCountLabel_) trackCountLabel_->setText(tr("%1 tracks, %2 layouts").arg(groupedTracks().size()).arg(backend_->property("track_count").toInt()));
-        selectedCar_ = textProperty(backend_, "car_id"); if (!applyTimer_.isActive()) selectedSkin_ = textProperty(backend_, "skin_id"); selectedTrack_ = textProperty(backend_, "track_id"); const QString layout = textProperty(backend_, "track_layout_id"); if (!layout.isEmpty()) selectedTrack_ += "/" + layout;
-        const QString carsJson = textProperty(backend_, "cars_json"); if (carsJson != carsCache_) { carsCache_ = carsJson; cars_ = QJsonDocument::fromJson(carsJson.toUtf8()).array(); populateCatalog(carList_, cars_); }
-        const QString tracksJson = textProperty(backend_, "tracks_json"); if (tracksJson != tracksCache_) { tracksCache_ = tracksJson; tracks_ = QJsonDocument::fromJson(tracksJson.toUtf8()).array(); populateCatalog(trackList_, tracks_); }
+        if (!applyTimer_.isActive()) { selectedCar_ = textProperty(backend_, "car_id"); selectedSkin_ = textProperty(backend_, "skin_id"); selectedTrack_ = textProperty(backend_, "track_id"); const QString layout = textProperty(backend_, "track_layout_id"); if (!layout.isEmpty()) selectedTrack_ += "/" + layout; }
+        const QString carsJson = textProperty(backend_, "cars_json"); if (carsJson != carsCache_) { carsCache_ = carsJson; cars_ = QJsonDocument::fromJson(carsJson.toUtf8()).array(); populateCatalog(carList_); }
+        const QString tracksJson = textProperty(backend_, "tracks_json"); if (tracksJson != tracksCache_) { tracksCache_ = tracksJson; tracks_ = QJsonDocument::fromJson(tracksJson.toUtf8()).array(); populateCatalog(trackList_); }
         const QString replayJson = textProperty(backend_, "replays_json"); if (replayJson != replayCache_) { replayCache_ = replayJson; replayList_->clear(); for (const auto &value : QJsonDocument::fromJson(replayJson.toUtf8()).array()) replayList_->addItem(value.toObject().value("name").toString()); }
         const QString conditionsJson = textProperty(backend_, "conditions_json"); if (conditionsJson != conditionsCache_) { conditionsCache_ = conditionsJson; conditions_ = QJsonDocument::fromJson(conditionsJson.toUtf8()).object(); updateDrive(); }
         const QString weatherJson = textProperty(backend_, "weather_json"); if (weatherJson != weatherCache_) { weatherCache_ = weatherJson; const auto array = QJsonDocument::fromJson(weatherJson.toUtf8()).array(); weather_->clear(); for (const auto &value : array) { const auto item = value.toObject(); weather_->addItem(item.value("name").toString(), item.value("id").toString()); } updateDrive(); }
@@ -936,8 +1000,8 @@ private:
         if (cspInstallRelease_) cspInstallRelease_->setEnabled(!contentBusy && cspReleaseList_->currentRow() >= 0);
         const QString presets = textProperty(backend_, "presets_json"); if (presets != presetsCache_) { presetsCache_ = presets; if (presetList_) { presetList_->clear(); for (const auto &value : QJsonDocument::fromJson(presets.toUtf8()).array()) { const auto item = value.toObject(); presetList_->addItem(item.value("name").toString(), item.value("id").toString()); } } }
         const QString appLayout = textProperty(backend_, "app_layout_json"); if (appLayout != appLayoutCache_) { appLayoutCache_ = appLayout; appLayout_ = QJsonDocument::fromJson(appLayout.toUtf8()).object(); }
-        updateSkins(); updateTrackLayouts();
-        carPreview_->setText(textProperty(backend_, "car_name") + "\n" + textProperty(backend_, "skin_name")); carPreview_->setIcon(QIcon(pixmapFromUrl(selectedCarPreview(), QSize(320, 145)))); trackPreview_->setText(textProperty(backend_, "track_name") + "\n" + textProperty(backend_, "track_layout")); trackPreview_->setIcon(QIcon(pixmapFromUrl(selectedTrackPreview(), QSize(320, 145))));
+        updateCarVariants(); updateSkins(); updateTrackLayouts();
+        carPreview_->setText(textProperty(backend_, "car_name") + "\n" + textProperty(backend_, "skin_name")); carPreview_->setIcon(QIcon(pixmapFromUrl(selectedCarPreview(), QSize(320, 145)))); trackPreview_->setText(textProperty(backend_, "track_name") + "\n" + textProperty(backend_, "track_layout")); trackPreview_->setIcon(QIcon(pixmapFromUrl(selectedTrackImage(), QSize(320, 145))));
     }
 
     QVector<QJsonObject> groupedTracks() const
@@ -960,6 +1024,7 @@ private:
             layouts.append(layout);
             groups[position]["layouts"] = layouts;
             groups[position]["favorite"] = groups[position].value("favorite").toBool() || layout.value("favorite").toBool();
+            groups[position]["dashboard"] = groups[position].value("dashboard").toBool() || layout.value("dashboard").toBool();
         }
         for (QJsonObject &group : groups) {
             const QString fallback = humanizeTrackId(group.value("base_id").toString());
@@ -968,22 +1033,66 @@ private:
         return groups;
     }
 
-    void populateCatalog(QListWidget *list, const QJsonArray &items)
+    QVector<QJsonObject> groupedCars() const
+    {
+        QVector<QJsonObject> groups;
+        QMap<QString, int> positions;
+        for (const auto &value : cars_) {
+            const QJsonObject car = value.toObject();
+            const QString parent = car.value("parent").toString();
+            const QString base = parent.isEmpty() ? car.value("id").toString() : parent;
+            int position = positions.value(base, -1);
+            if (position < 0) {
+                QJsonObject group = car;
+                group["base_id"] = base;
+                group["variants"] = QJsonArray{};
+                groups.append(group);
+                position = groups.size() - 1;
+                positions.insert(base, position);
+            } else if (car.value("id").toString() == base) {
+                const QJsonArray variants = groups[position].value("variants").toArray();
+                const bool favorite = groups[position].value("favorite").toBool();
+                const bool dashboard = groups[position].value("dashboard").toBool();
+                groups[position] = car;
+                groups[position]["base_id"] = base;
+                groups[position]["variants"] = variants;
+                groups[position]["favorite"] = favorite;
+                groups[position]["dashboard"] = dashboard;
+            }
+            QJsonArray variants = groups[position].value("variants").toArray();
+            variants.append(car);
+            groups[position]["variants"] = variants;
+            groups[position]["favorite"] = groups[position].value("favorite").toBool() || car.value("favorite").toBool();
+            groups[position]["dashboard"] = groups[position].value("dashboard").toBool() || car.value("dashboard").toBool();
+        }
+        return groups;
+    }
+
+    void populateCatalog(QListWidget *list)
     {
         const bool cars = list == carList_;
         CatalogWidgets &catalog = cars ? carCatalog_ : trackCatalog_;
+        const QString browsedChoice = catalog.layouts->currentIndex() >= 0
+            ? catalog.layouts->currentData().toJsonObject().value("id").toString()
+            : QString();
         QVector<QJsonObject> objects;
         if (cars) {
-            for (const auto &value : items) objects.append(value.toObject());
+            objects = groupedCars();
         } else {
             objects = groupedTracks();
         }
-        const QString needle = catalog.search ? catalog.search->text() : QString();
         const QString transmission = catalog.filter ? catalog.filter->currentData().toString() : QString();
         objects.erase(std::remove_if(objects.begin(), objects.end(), [&](const QJsonObject &object) {
             if (catalog.favoritesOnly && catalog.favoritesOnly->isChecked() && !object.value("favorite").toBool()) return true;
-            if (!transmission.isEmpty() && !object.value("transmission").toString().split(',').contains(transmission, Qt::CaseInsensitive)) return true;
-            return !needle.isEmpty() && !QString::fromUtf8(QJsonDocument(object).toJson(QJsonDocument::Compact)).contains(needle, Qt::CaseInsensitive);
+            if (!transmission.isEmpty()) {
+                bool matches = object.value("transmission").toString().split(',').contains(transmission, Qt::CaseInsensitive);
+                if (cars) {
+                    for (const auto &variant : object.value("variants").toArray())
+                        matches = matches || variant.toObject().value("transmission").toString().split(',').contains(transmission, Qt::CaseInsensitive);
+                }
+                if (!matches) return true;
+            }
+            return false;
         }), objects.end());
         const QString ordering = catalog.sort ? catalog.sort->currentData().toString() : QStringLiteral("name");
         std::sort(objects.begin(), objects.end(), [&](const QJsonObject &left, const QJsonObject &right) {
@@ -992,9 +1101,24 @@ private:
             const QString key = ordering == "author" ? QStringLiteral("author") : ordering == "power" ? QStringLiteral("power") : QStringLiteral("name");
             return left.value(key).toString().localeAwareCompare(right.value(key).toString()) < 0;
         });
-        QString selectedId = catalog.selected.value(cars ? "id" : "base_id").toString();
-        if (selectedId.isEmpty())
-            selectedId = cars ? selectedCar_ : selectedTrack_.section('/', 0, 0);
+        QString selectedId = catalog.selected.value("base_id").toString();
+        if (selectedId.isEmpty()) {
+            const QString current = cars ? selectedCar_ : selectedTrack_;
+            const char *choicesKey = cars ? "variants" : "layouts";
+            for (const QJsonObject &object : objects) {
+                for (const auto &choice : object.value(choicesKey).toArray()) {
+                    if (choice.toObject().value("id").toString() == current) {
+                        selectedId = object.value("base_id").toString();
+                        break;
+                    }
+                }
+                if (!selectedId.isEmpty()) break;
+            }
+        }
+        catalog.selected = QJsonObject();
+        catalog.favorite->setEnabled(false);
+        catalog.dashboard->setEnabled(false);
+        catalog.use->setEnabled(false);
         list->clear();
         for (const QJsonObject &object : objects) {
             QString text;
@@ -1004,42 +1128,79 @@ private:
                 if (!object.value("transmission").toString().isEmpty()) facts.append(object.value("transmission").toString());
                 if (!object.value("power").toString().isEmpty()) facts.append(object.value("power").toString());
                 text = object.value("name").toString() + "\n" + facts.join(QStringLiteral(" | "));
+                const int variants = object.value("variants").toArray().size();
+                if (variants > 1) text += tr("\n%1 variants").arg(variants);
                 if (!object.value("author").toString().isEmpty()) text += tr("\nby %1").arg(object.value("author").toString());
             } else {
                 const int layouts = object.value("layouts").toArray().size();
                 text = object.value("name").toString() + tr("\n%1 layout(s)").arg(layouts);
                 if (!object.value("author").toString().isEmpty()) text += tr(" | by %1").arg(object.value("author").toString());
             }
-            auto *item = new QListWidgetItem(QIcon(pixmapFromUrl(object.value("preview").toString(), QSize(220, 125))), text);
+            const QString image = cars || object.value("outline").toString().isEmpty()
+                ? object.value("preview").toString()
+                : object.value("outline").toString();
+            auto *item = new QListWidgetItem(QIcon(pixmapFromUrl(image, QSize(220, 125))), text);
             item->setData(Qt::UserRole, object);
             item->setData(Qt::UserRole + 1, QString::fromUtf8(QJsonDocument(object).toJson(QJsonDocument::Compact)));
             item->setToolTip(object.value("favorite").toBool() ? tr("Favorite") : object.value("subtitle").toString());
             list->addItem(item);
-            if (object.value(cars ? "id" : "base_id").toString() == selectedId) { catalog.selected = object; list->setCurrentItem(item); }
+            if (object.value("base_id").toString() == selectedId) { catalog.selected = object; list->setCurrentItem(item); }
         }
-        if (!catalog.selected.isEmpty()) showCatalogDetails(cars);
-        if (cars && carCountLabel_) carCountLabel_->setText(tr("%1 of %2 cars").arg(objects.size()).arg(cars_.size()));
+        if (!catalog.selected.isEmpty()) inspectCatalogItem(cars, catalog.selected, browsedChoice);
+        if (cars && carCountLabel_) carCountLabel_->setText(tr("%1 models, %2 variants").arg(objects.size()).arg(cars_.size()));
         if (!cars && trackCountLabel_) trackCountLabel_->setText(tr("%1 tracks, %2 layouts").arg(groupedTracks().size()).arg(tracks_.size()));
+        filterCatalogSearch(list);
     }
 
-    void inspectCatalogItem(bool cars, const QJsonObject &object)
+    void filterCatalogSearch(QListWidget *list)
+    {
+        const bool cars = list == carList_;
+        CatalogWidgets &catalog = cars ? carCatalog_ : trackCatalog_;
+        const QString needle = catalog.search ? catalog.search->text() : QString();
+        int visible = 0;
+        bool selectedHidden = false;
+        for (int index = 0; index < list->count(); ++index) {
+            QListWidgetItem *item = list->item(index);
+            const bool hidden = !needle.isEmpty()
+                && !item->data(Qt::UserRole + 1).toString().contains(needle, Qt::CaseInsensitive);
+            item->setHidden(hidden);
+            selectedHidden = selectedHidden || (hidden && item->isSelected());
+            if (!hidden) ++visible;
+        }
+        if (selectedHidden) {
+            list->clearSelection();
+            catalog.selected = QJsonObject();
+            catalog.layouts->hide();
+            catalog.favorite->setEnabled(false);
+            catalog.dashboard->setEnabled(false);
+            catalog.use->setEnabled(false);
+        }
+        if (cars && carCountLabel_)
+            carCountLabel_->setText(tr("%1 of %2 models, %3 variants").arg(visible).arg(list->count()).arg(cars_.size()));
+        if (!cars && trackCountLabel_)
+            trackCountLabel_->setText(tr("%1 of %2 tracks, %3 layouts").arg(visible).arg(list->count()).arg(tracks_.size()));
+    }
+
+    void inspectCatalogItem(bool cars, const QJsonObject &object, const QString &preferredChoice)
     {
         CatalogWidgets &catalog = cars ? carCatalog_ : trackCatalog_;
         catalog.selected = object;
-        if (!cars) {
-            const QSignalBlocker blocker(catalog.layouts);
-            catalog.layouts->clear();
-            const QJsonArray layouts = object.value("layouts").toArray();
-            for (const auto &value : layouts) {
-                const QJsonObject layout = value.toObject();
-                catalog.layouts->addItem(layout.value("name").toString(), layout);
-            }
-            int selected = -1;
-            for (int index = 0; index < catalog.layouts->count(); ++index) {
-                if (catalog.layouts->itemData(index).toJsonObject().value("id").toString() == selectedTrack_) { selected = index; break; }
-            }
-            catalog.layouts->setCurrentIndex(selected >= 0 ? selected : 0);
+        const QSignalBlocker blocker(catalog.layouts);
+        catalog.layouts->clear();
+        const QJsonArray choices = object.value(cars ? "variants" : "layouts").toArray();
+        for (const auto &value : choices) {
+            const QJsonObject choice = value.toObject();
+            catalog.layouts->addItem(choice.value("name").toString(), choice);
         }
+        catalog.layouts->setVisible(choices.size() > 1);
+        const QString current = cars ? selectedCar_ : selectedTrack_;
+        int selected = -1;
+        for (int index = 0; index < catalog.layouts->count(); ++index) {
+            const QString id = catalog.layouts->itemData(index).toJsonObject().value("id").toString();
+            if (id == preferredChoice) { selected = index; break; }
+            if (selected < 0 && id == current) selected = index;
+        }
+        catalog.layouts->setCurrentIndex(selected >= 0 ? selected : 0);
         showCatalogDetails(cars);
     }
 
@@ -1048,9 +1209,12 @@ private:
         CatalogWidgets &catalog = cars ? carCatalog_ : trackCatalog_;
         if (catalog.selected.isEmpty()) return;
         QJsonObject object = catalog.selected;
-        if (!cars && catalog.layouts->currentIndex() >= 0) object = catalog.layouts->currentData().toJsonObject();
-        catalog.image->setPixmap(pixmapFromUrl(object.value("preview").toString(), QSize(430, 240)));
-        catalog.title->setText(cars ? object.value("name").toString() : catalog.selected.value("name").toString());
+        if (catalog.layouts->currentIndex() >= 0) object = catalog.layouts->currentData().toJsonObject();
+        const QString image = cars || object.value("outline").toString().isEmpty()
+            ? object.value("preview").toString()
+            : object.value("outline").toString();
+        catalog.image->setPixmap(pixmapFromUrl(image, QSize(430, 240)));
+        catalog.title->setText(object.value("name").toString());
         QStringList details;
         const QList<QPair<QString, QString>> values = cars
             ? QList<QPair<QString, QString>>{{tr("Brand"), object.value("subtitle").toString()}, {tr("Author"), object.value("author").toString()}, {tr("Class"), object.value("class_name").toString()}, {tr("Power"), object.value("power").toString()}, {tr("Torque"), object.value("torque").toString()}, {tr("Weight"), object.value("weight").toString()}, {tr("Power/weight"), object.value("power_weight").toString()}, {tr("Top speed"), object.value("top_speed").toString()}, {tr("Acceleration"), object.value("acceleration").toString()}, {tr("Drivetrain"), object.value("drivetrain").toString()}, {tr("Transmission"), object.value("transmission").toString()}}
@@ -1058,21 +1222,22 @@ private:
         for (const auto &[label, value] : values) if (!value.isEmpty()) details.append(label + QStringLiteral(": ") + value);
         if (!object.value("description").toString().isEmpty()) details.append(QStringLiteral("\n") + object.value("description").toString());
         catalog.details->setText(details.join('\n'));
-        catalog.favorite->setEnabled(true); catalog.use->setEnabled(true);
-        catalog.favorite->setText(catalog.selected.value("favorite").toBool() ? tr("Remove Favorite") : tr("Add Favorite"));
+        catalog.favorite->setEnabled(true); catalog.dashboard->setEnabled(true); catalog.use->setEnabled(true);
+        catalog.favorite->setText(object.value("favorite").toBool() ? tr("Remove Favorite") : tr("Add Favorite"));
+        catalog.dashboard->setText(object.value("dashboard").toBool() ? tr("Remove from Dashboard") : tr("Add to Dashboard"));
     }
 
     void commitCatalogItem(bool cars)
     {
         CatalogWidgets &catalog = cars ? carCatalog_ : trackCatalog_;
         if (catalog.selected.isEmpty()) return;
+        const QJsonObject choice = catalog.layouts->currentData().toJsonObject();
+        if (choice.isEmpty()) return;
         if (cars) {
-            selectedCar_ = catalog.selected.value("id").toString();
-            selectedSkin_ = catalog.selected.value("skin").toString();
+            selectedCar_ = choice.value("id").toString();
+            selectedSkin_ = choice.value("skin").toString();
         } else {
-            const QJsonObject layout = catalog.layouts->currentData().toJsonObject();
-            if (layout.isEmpty()) return;
-            selectedTrack_ = layout.value("id").toString();
+            selectedTrack_ = choice.value("id").toString();
         }
         applyDrive();
         navigation_->setCurrentRow(0);
@@ -1083,8 +1248,19 @@ private:
         CatalogWidgets &catalog = cars ? carCatalog_ : trackCatalog_;
         if (catalog.selected.isEmpty()) return;
         const QString kind = cars ? QStringLiteral("car") : QStringLiteral("track");
-        const QString id = catalog.selected.value(cars ? "id" : "base_id").toString();
+        const QString id = catalog.layouts->currentData().toJsonObject().value("id").toString();
+        if (id.isEmpty()) return;
         QMetaObject::invokeMethod(backend_, "toggleFavorite", Q_ARG(QString, kind), Q_ARG(QString, id));
+    }
+
+    void toggleCatalogDashboard(bool cars)
+    {
+        CatalogWidgets &catalog = cars ? carCatalog_ : trackCatalog_;
+        if (catalog.selected.isEmpty()) return;
+        const QString kind = cars ? QStringLiteral("car") : QStringLiteral("track");
+        const QJsonObject object = catalog.layouts->currentData().toJsonObject();
+        const QString id = object.value("id").toString();
+        if (!id.isEmpty()) QMetaObject::invokeMethod(backend_, "toggleDashboardItem", Q_ARG(QString, kind), Q_ARG(QString, id));
     }
 
     void updateDrive()
@@ -1117,6 +1293,50 @@ private:
         skin_->setCurrentIndex(qMax(0, skin_->findData(selectedSkin_)));
     }
 
+    void updateCarVariants()
+    {
+        QString base;
+        for (const auto &value : cars_) {
+            const QJsonObject car = value.toObject();
+            if (car.value("id").toString() != selectedCar_) continue;
+            const QString parent = car.value("parent").toString();
+            base = parent.isEmpty() ? selectedCar_ : parent;
+            break;
+        }
+        if (base.isEmpty()) return;
+
+        QJsonArray variants;
+        for (const auto &value : cars_) {
+            const QJsonObject car = value.toObject();
+            if (car.value("id").toString() == base || car.value("parent").toString() == base)
+                variants.append(car);
+        }
+        bool matches = carVariant_->count() == variants.size();
+        for (int index = 0; matches && index < variants.size(); ++index)
+            matches = carVariant_->itemData(index).toJsonObject().value("id").toString()
+                == variants.at(index).toObject().value("id").toString();
+        if (!matches) {
+            const QSignalBlocker blocker(carVariant_);
+            carVariant_->clear();
+            for (const auto &value : variants) {
+                const QJsonObject variant = value.toObject();
+                carVariant_->addItem(
+                    QIcon(pixmapFromUrl(variant.value("preview").toString(), QSize(144, 81))),
+                    variant.value("name").toString(),
+                    variant
+                );
+            }
+        }
+        int selected = -1;
+        for (int index = 0; index < carVariant_->count(); ++index) {
+            if (carVariant_->itemData(index).toJsonObject().value("id").toString() == selectedCar_) {
+                selected = index;
+                break;
+            }
+        }
+        carVariant_->setCurrentIndex(selected >= 0 ? selected : 0);
+    }
+
     void updateTrackLayouts()
     {
         const QString base = selectedTrack_.section('/', 0, 0);
@@ -1135,7 +1355,10 @@ private:
             trackLayout_->clear();
             for (const auto &value : layouts) {
                 const QJsonObject layout = value.toObject();
-                trackLayout_->addItem(QIcon(pixmapFromUrl(layout.value("preview").toString(), QSize(144, 81))),
+                const QString image = layout.value("outline").toString().isEmpty()
+                    ? layout.value("preview").toString()
+                    : layout.value("outline").toString();
+                trackLayout_->addItem(QIcon(pixmapFromUrl(image, QSize(144, 81))),
                                       layout.value("name").toString(), layout);
             }
         }
@@ -1164,19 +1387,21 @@ private:
         return textProperty(backend_, "car_preview");
     }
 
-    QString selectedTrackPreview() const
+    QString selectedTrackImage() const
     {
         for (const auto &value : tracks_) {
             const QJsonObject track = value.toObject();
-            if (track.value("id").toString() == selectedTrack_ && !track.value("preview").toString().isEmpty())
-                return track.value("preview").toString();
+            if (track.value("id").toString() != selectedTrack_) continue;
+            if (!track.value("outline").toString().isEmpty()) return track.value("outline").toString();
+            if (!track.value("preview").toString().isEmpty()) return track.value("preview").toString();
         }
-        return textProperty(backend_, "track_preview");
+        const QString outline = textProperty(backend_, "track_outline");
+        return outline.isEmpty() ? textProperty(backend_, "track_preview") : outline;
     }
 
     Backend *backend_;
     QListWidget *navigation_{}; QStackedWidget *stack_{}; QLabel *statusLabel_{}; QLabel *cspLabel_{}; QProgressBar *busy_{};
-    QToolButton *carPreview_{}; QToolButton *trackPreview_{}; QLabel *launchSummary_{}; QComboBox *mode_{}; QComboBox *skin_{}; QComboBox *trackLayout_{}; QComboBox *weather_{}; QSpinBox *opponents_{}; QSpinBox *ai_{}; QSpinBox *laps_{}; QSpinBox *duration_{}; QSpinBox *air_{}; QSpinBox *road_{}; QCheckBox *penalties_{}; QTimeEdit *time_{};
+    QToolButton *carPreview_{}; QToolButton *trackPreview_{}; QLabel *launchSummary_{}; QPushButton *driveButton_{}; QAction *driveAction_{}; QComboBox *mode_{}; QComboBox *carVariant_{}; QComboBox *skin_{}; QComboBox *trackLayout_{}; QComboBox *weather_{}; QSpinBox *opponents_{}; QSpinBox *ai_{}; QSpinBox *laps_{}; QSpinBox *duration_{}; QSpinBox *air_{}; QSpinBox *road_{}; QCheckBox *penalties_{}; QTimeEdit *time_{};
     QListWidget *carList_{}; QListWidget *trackList_{}; QListWidget *replayList_{}; QLineEdit *carSearch_{}; QLineEdit *trackSearch_{}; QLabel *carCountLabel_{}; QLabel *trackCountLabel_{};
     CatalogWidgets carCatalog_, trackCatalog_;
     QLabel *contentCspStatus_{}; QLineEdit *contentArchivePath_{}; QLabel *contentPreview_{}; QPushButton *contentInstall_{}; QListWidget *contentHistory_{}; QPushButton *contentRollback_{}; QLabel *contentError_{}; int contentReplacements_ = 0;
@@ -1184,7 +1409,7 @@ private:
     QLineEdit *onlineSearch_{}; QTableWidget *onlineTable_{}; QLabel *onlineDetails_{}; QComboBox *onlineCar_{}; QLineEdit *onlinePassword_{}; QPushButton *onlineJoin_{}; QLabel *onlineError_{};
     QLabel *showroomSelection_{}; QLabel *setupSummary_{}; QTableWidget *setupList_{}; QComboBox *setupTrack_{}; QLineEdit *setupName_{}; QPushButton *setupUse_{}; QPushButton *setupDelete_{}; QLabel *toolsError_{};
     QLineEdit *settingsSearch_{}; QTabBar *settingsKind_{}; QListWidget *moduleList_{}; QScrollArea *settingsScroll_{}; QLineEdit *presetName_{}; QComboBox *presetList_{};
-    QTimer poll_; QTimer applyTimer_; bool updating_ = false;
+    QTimer poll_; QTimer racePoll_; QTimer applyTimer_; bool updating_ = false;
     bool cspReleaseRequested_ = false;
     QString selectedCar_, selectedSkin_, selectedTrack_, carsCache_, tracksCache_, replayCache_, conditionsCache_, weatherCache_, acCache_, cspCache_, controlsCache_, controlInputCache_, presetsCache_, appLayoutCache_, contentPreviewCache_, contentHistoryCache_, cspReleasesCache_, serversCache_, setupsCache_;
     QJsonArray cars_, tracks_, acModules_, cspModules_, visibleModules_, onlineServers_; QJsonObject conditions_, controls_, appLayout_; QMap<QString, QDoubleSpinBox *> conditionEditors_;
@@ -1203,6 +1428,7 @@ int run_aclm_widgets()
     application.setApplicationName(QStringLiteral("AC Linux Manager"));
     application.setOrganizationName(QStringLiteral("AC Linux Manager"));
     application.setWindowIcon(QIcon(QStringLiteral(":/icons/ac-linux-manager.svg")));
+    QPixmapCache::setCacheLimit(128 * 1024);
     Backend backend;
     MainWindow window(&backend);
     window.show();
