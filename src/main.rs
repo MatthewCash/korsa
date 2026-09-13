@@ -8,6 +8,7 @@ mod csp;
 mod csp_versions;
 mod discovery;
 mod installer;
+mod ipc;
 mod launcher;
 mod online;
 mod preferences;
@@ -27,12 +28,52 @@ fn main() -> Result<()> {
         .context("failed to create Tokio runtime")?;
     runtime::initialize(tokio_runtime.handle().clone())?;
 
-    if std::env::args().any(|argument| argument == "--launch-last") {
-        let installation = discovery::discover()?;
-        let process_id =
-            tokio_runtime.block_on(launcher::launch_existing_session(&installation))?;
-        log::info!("started the last configured session as process {process_id}");
-        return Ok(());
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    match arguments.as_slice() {
+        [command] if command == "--launch-last" => {
+            let installation = discovery::discover()?;
+            let _lock = configuration::lock_session(&installation)?;
+            let process_id =
+                tokio_runtime.block_on(launcher::launch_existing_session(&installation))?;
+            log::info!("started the last configured session as process {process_id}");
+            return Ok(());
+        }
+        [command] if command == "--dashboard-json" => {
+            let installation = discovery::discover()?;
+            let preferences = preferences::Preferences::load()?;
+            println!("{}", content::dashboard_json(&installation, &preferences)?);
+            return Ok(());
+        }
+        [command] if command == "--race-running" => {
+            println!("{}", launcher::race_is_running()?);
+            return Ok(());
+        }
+        [command] if command == "--stop-race" => {
+            let installation = discovery::discover()?;
+            let _lock = configuration::lock_session(&installation)?;
+            tokio_runtime.block_on(launcher::stop_race())?;
+            return Ok(());
+        }
+        [command, car_id, track_key, start_minutes] if command == "--dashboard-launch" => {
+            let installation = discovery::discover()?;
+            let _lock = configuration::lock_session(&installation)?;
+            configuration::apply_dashboard_configuration(
+                &installation,
+                car_id,
+                track_key,
+                start_minutes
+                    .parse()
+                    .context("invalid dashboard start time")?,
+            )?;
+            let process_id =
+                tokio_runtime.block_on(launcher::launch_existing_session(&installation))?;
+            log::info!("started dashboard session as process {process_id}");
+            return Ok(());
+        }
+        [] => {}
+        _ => anyhow::bail!(
+            "usage: ac-linux-manager [--launch-last | --dashboard-json | --race-running | --stop-race | --dashboard-launch CAR TRACK START_MINUTES]"
+        ),
     }
 
     log::info!("starting AC Linux Manager");

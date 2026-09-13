@@ -7,8 +7,43 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use std::{
     fs,
+    fs::{File, OpenOptions},
+    os::fd::AsRawFd,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+pub struct SessionLock(File);
+
+pub fn lock_session(installation: &Installation) -> Result<SessionLock> {
+    session_lock(installation, false)
+}
+
+fn try_lock_session(installation: &Installation) -> Result<SessionLock> {
+    session_lock(installation, true)
+}
+
+fn session_lock(installation: &Installation, nonblocking: bool) -> Result<SessionLock> {
+    let path = installation.documents_root.join("cfg/.aclm-session.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("could not open {}", path.display()))?;
+    let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+    let result = unsafe { libc::flock(file.as_raw_fd(), operation) };
+    anyhow::ensure!(
+        result == 0,
+        "another Assetto Corsa session is being configured or launched"
+    );
+    Ok(SessionLock(file))
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct WeatherItem {
@@ -225,6 +260,7 @@ pub fn apply_preset(
     preferences: &Preferences,
     id: &str,
 ) -> Result<Conditions> {
+    let _lock = try_lock_session(installation)?;
     let preset = preferences
         .presets
         .iter()
@@ -247,11 +283,65 @@ pub fn apply_configuration_json(
     track_key: &str,
     conditions_json: &str,
 ) -> Result<Conditions> {
+    let _lock = try_lock_session(installation)?;
+    apply_configuration_json_unlocked(installation, car_id, skin_id, track_key, conditions_json)
+}
+
+pub fn apply_configuration_json_unlocked(
+    installation: &Installation,
+    car_id: &str,
+    skin_id: &str,
+    track_key: &str,
+    conditions_json: &str,
+) -> Result<Conditions> {
     anyhow::ensure!(!car_id.is_empty(), "a car must be selected");
     anyhow::ensure!(!track_key.is_empty(), "a track must be selected");
     let conditions = serde_json::from_str(conditions_json).context("invalid track conditions")?;
     apply_configuration(installation, car_id, skin_id, track_key, &conditions)?;
     Ok(conditions)
+}
+
+pub fn apply_dashboard_configuration(
+    installation: &Installation,
+    car_id: &str,
+    track_key: &str,
+    start_minutes: i32,
+) -> Result<()> {
+    anyhow::ensure!(
+        (0..1440).contains(&start_minutes),
+        "start time must be between 00:00 and 23:59"
+    );
+    anyhow::ensure!(
+        installation
+            .game_root
+            .join("content/cars")
+            .join(car_id)
+            .is_dir(),
+        "car is not installed: {car_id}"
+    );
+    let (track_id, _) = split_track_key(track_key);
+    anyhow::ensure!(
+        installation
+            .game_root
+            .join("content/tracks")
+            .join(&track_id)
+            .is_dir(),
+        "track is not installed: {track_key}"
+    );
+
+    let session = session::load(installation)?;
+    let skins = installed_skins(installation, car_id);
+    let skin_id = if session.car_id == car_id && skins.contains(&session.skin_id) {
+        session.skin_id
+    } else {
+        skins
+            .first()
+            .cloned()
+            .context("selected car has no installed skins")?
+    };
+    let mut conditions = load_conditions(installation)?;
+    conditions.sun_angle = (f64::from(start_minutes) / 60.0 - 13.0) * 16.0;
+    apply_configuration(installation, car_id, &skin_id, track_key, &conditions)
 }
 
 fn apply_configuration(
@@ -560,6 +650,7 @@ mod tests {
         fs::create_dir_all(documents_root.join("cfg")).unwrap();
         fs::create_dir_all(game_root.join("content/cars/test_car/skins/red")).unwrap();
         fs::create_dir_all(game_root.join("content/cars/test_car/skins/blue")).unwrap();
+        fs::create_dir_all(game_root.join("content/tracks/test_track")).unwrap();
         fs::write(
             documents_root.join("cfg/race.ini"),
             "[RACE]\nCARS=1\n[CAR_0]\nMODEL=-\n[SESSION_0]\nTYPE=1\n",
@@ -602,6 +693,12 @@ mod tests {
         assert!(output.contains("[CAR_1]"));
         assert!(output.contains("[CAR_2]"));
         assert!(output.matches("AI_LEVEL=94").count() >= 3);
+
+        apply_dashboard_configuration(&installation, "test_car", "test_track/layout", 18 * 60)
+            .unwrap();
+        let output = fs::read_to_string(installation.documents_root.join("cfg/race.ini")).unwrap();
+        assert!(output.contains("RACE_LAPS=12"));
+        assert!(output.contains("SUN_ANGLE=80"));
 
         fs::remove_dir_all(root).unwrap();
     }

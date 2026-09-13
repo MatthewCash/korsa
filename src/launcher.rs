@@ -8,6 +8,36 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 const STABILITY_WINDOW: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const LAUNCH_SERVICE: &str = "com.steampowered.PressureVessel.LaunchAlongsideSteam";
+const RACE_PROCESS_NAME: &str = "acs.exe";
+
+pub fn race_is_running() -> Result<bool> {
+    Ok(!race_process_ids()?.is_empty())
+}
+
+pub async fn stop_race() -> Result<()> {
+    if !race_is_running()? {
+        return Ok(());
+    }
+    signal_race_processes(libc::SIGTERM)?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        if !race_is_running()? {
+            return Ok(());
+        }
+        sleep(POLL_INTERVAL).await;
+    }
+
+    signal_race_processes(libc::SIGKILL)?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if !race_is_running()? {
+            return Ok(());
+        }
+        sleep(POLL_INTERVAL).await;
+    }
+    bail!("Assetto Corsa is still running after SIGKILL")
+}
 
 pub async fn launch_existing_session(installation: &Installation) -> Result<u32> {
     validate(installation)?;
@@ -330,7 +360,7 @@ fn required_paths(installation: &Installation) -> [(&'static str, PathBuf); 6] {
 }
 
 fn process_is_running() -> Result<bool> {
-    process_matches("(^|[/\\\\])acs\\.exe($| )")
+    race_is_running()
 }
 
 fn process_matches(pattern: &str) -> Result<bool> {
@@ -339,7 +369,65 @@ fn process_matches(pattern: &str) -> Result<bool> {
         .output()
         .context("failed to inspect running processes")?;
 
-    Ok(output.status.success())
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!(
+            "pgrep failed while inspecting running processes: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ),
+    }
+}
+
+fn race_process_ids() -> Result<Vec<i32>> {
+    let processes = fs::read_dir("/proc").context("failed to inspect running processes")?;
+    Ok(processes
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<i32>().ok())
+        .filter(|pid| is_assetto_corsa_process(*pid))
+        .collect())
+}
+
+fn is_assetto_corsa_process(pid: i32) -> bool {
+    let Ok(command_line) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    if !is_race_command(&command_line) {
+        return false;
+    }
+
+    let Ok(environment) = fs::read(format!("/proc/{pid}/environ")) else {
+        return false;
+    };
+    environment.split(|byte| *byte == 0).any(|variable| {
+        variable == format!("STEAM_COMPAT_APP_ID={APP_ID}").as_bytes()
+            || variable == format!("SteamAppId={APP_ID}").as_bytes()
+    })
+}
+
+fn is_race_command(command_line: &[u8]) -> bool {
+    let executable = command_line
+        .split(|byte| *byte == 0)
+        .next()
+        .unwrap_or_default();
+    executable
+        .rsplit(|byte| matches!(byte, b'/' | b'\\'))
+        .next()
+        .is_some_and(|name| name.eq_ignore_ascii_case(RACE_PROCESS_NAME.as_bytes()))
+}
+
+fn signal_race_processes(signal: i32) -> Result<()> {
+    for pid in race_process_ids()? {
+        let result = unsafe { libc::kill(pid, signal) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error)
+                    .with_context(|| format!("could not signal Assetto Corsa PID {pid}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -386,6 +474,13 @@ mod tests {
                 .iter()
                 .any(|argument| argument.contains("AssettoCorsa.exe"))
         );
+    }
+
+    #[test]
+    fn recognizes_renamed_wine_race_from_its_command_line() {
+        assert!(is_race_command(b"Z:\\home\\user\\assettocorsa\\acs.exe\0"));
+        assert!(is_race_command(b"/games/assettocorsa/ACS.EXE\0"));
+        assert!(!is_race_command(b"/games/assettocorsa/AssettoCorsa.exe\0"));
     }
 
     #[test]

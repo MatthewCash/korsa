@@ -25,6 +25,8 @@ struct CatalogItem {
     subtitle: String,
     preview: String,
     favorite: bool,
+    dashboard: bool,
+    parent: String,
     transmission: String,
     skin: String,
     author: String,
@@ -61,10 +63,12 @@ pub fn load(installation: &Installation, preferences: &Preferences) -> Result<Ca
     let cars = load_cars(
         &installation.game_root.join("content/cars"),
         &preferences.favorite_cars,
+        &preferences.dashboard_cars,
     )?;
     let tracks = load_tracks(
         &installation.game_root.join("content/tracks"),
         &preferences.favorite_tracks,
+        &preferences.dashboard_tracks,
     )?;
     let replays = load_replays(&installation.documents_root.join("replay"));
 
@@ -81,8 +85,94 @@ pub fn load(installation: &Installation, preferences: &Preferences) -> Result<Ca
     })
 }
 
+pub fn dashboard_json(installation: &Installation, preferences: &Preferences) -> Result<String> {
+    #[derive(Serialize)]
+    struct DashboardOptions<'a> {
+        cars: Vec<DashboardItem<'a>>,
+        tracks: Vec<DashboardItem<'a>>,
+        times: [DashboardTime; 4],
+    }
+
+    #[derive(Serialize)]
+    struct DashboardItem<'a> {
+        id: &'a str,
+        name: &'a str,
+        preview: &'a str,
+        outline: &'a str,
+    }
+
+    #[derive(Serialize)]
+    struct DashboardTime {
+        name: &'static str,
+        minutes: i32,
+    }
+
+    let catalog = load(installation, preferences)?;
+    serde_json::to_string(&DashboardOptions {
+        cars: catalog
+            .cars
+            .iter()
+            .filter(|item| item.dashboard)
+            .map(|item| DashboardItem {
+                id: &item.id,
+                name: &item.name,
+                preview: &item.preview,
+                outline: &item.outline,
+            })
+            .collect(),
+        tracks: catalog
+            .tracks
+            .iter()
+            .filter(|item| item.dashboard)
+            .map(|item| DashboardItem {
+                id: &item.id,
+                name: &item.name,
+                preview: &item.preview,
+                outline: &item.outline,
+            })
+            .collect(),
+        times: [
+            DashboardTime {
+                name: "Dawn",
+                minutes: 6 * 60,
+            },
+            DashboardTime {
+                name: "Noon",
+                minutes: 12 * 60,
+            },
+            DashboardTime {
+                name: "Sunset",
+                minutes: 18 * 60,
+            },
+            DashboardTime {
+                name: "Midnight",
+                minutes: 0,
+            },
+        ],
+    })
+    .context("could not serialize dashboard choices")
+}
+
 impl Catalog {
+    pub fn contains(&self, kind: &str, id: &str) -> bool {
+        match kind {
+            "car" => &self.cars,
+            "track" => &self.tracks,
+            _ => return false,
+        }
+        .iter()
+        .any(|item| item.id == id)
+    }
+
     pub fn set_favorite(&mut self, kind: &str, id: &str, favorite: bool) -> Result<()> {
+        self.set_flag(kind, id, "favorite", favorite)
+    }
+
+    pub fn set_dashboard(&mut self, kind: &str, id: &str, selected: bool) -> Result<()> {
+        self.set_flag(kind, id, "dashboard", selected)
+    }
+
+    fn set_flag(&mut self, kind: &str, id: &str, flag: &str, value: bool) -> Result<()> {
         let items = match kind {
             "car" => &mut self.cars,
             "track" => &mut self.tracks,
@@ -90,8 +180,12 @@ impl Catalog {
         };
         let mut matched = false;
         for item in items.iter_mut() {
-            if item.id == id || (kind == "track" && item.id.starts_with(&format!("{id}/"))) {
-                item.favorite = favorite;
+            if item.id == id {
+                match flag {
+                    "favorite" => item.favorite = value,
+                    "dashboard" => item.dashboard = value,
+                    _ => unreachable!(),
+                }
                 matched = true;
             }
         }
@@ -109,6 +203,7 @@ impl Catalog {
 fn load_cars(
     root: &Path,
     favorites: &std::collections::BTreeSet<String>,
+    dashboard: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<CatalogItem>> {
     let mut cars = directories(root)?
         .into_iter()
@@ -157,6 +252,8 @@ fn load_cars(
 
             Some(CatalogItem {
                 favorite: favorites.contains(&id),
+                dashboard: dashboard.contains(&id),
+                parent: session::json_string(&metadata, "parent").unwrap_or_default(),
                 id,
                 name,
                 subtitle: brand,
@@ -188,6 +285,7 @@ fn load_cars(
 fn load_tracks(
     root: &Path,
     favorites: &std::collections::BTreeSet<String>,
+    dashboard: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<CatalogItem>> {
     let mut tracks = Vec::new();
 
@@ -235,7 +333,8 @@ fn load_tracks(
                 format!("{track_id}/{layout_id}")
             };
             tracks.push(CatalogItem {
-                favorite: favorites.contains(&id) || favorites.contains(&track_id),
+                favorite: favorites.contains(&id),
+                dashboard: dashboard.contains(&id),
                 id,
                 name,
                 subtitle,
@@ -253,7 +352,12 @@ fn load_tracks(
                 pitboxes: session::json_string(&metadata, "pitboxes").unwrap_or_default(),
                 direction: session::json_string(&metadata, "run").unwrap_or_default(),
                 year: json_scalar(&metadata, "year"),
-                outline: session::file_url(&layout_root.join("outline.png")),
+                outline: ["outline_cropped.png", "outline.png"]
+                    .into_iter()
+                    .map(|name| layout_root.join(name))
+                    .find(|path| path.is_file())
+                    .map(|path| session::file_url(&path))
+                    .unwrap_or_default(),
                 ..CatalogItem::default()
             });
         }
@@ -409,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn base_track_favorite_updates_every_layout() {
+    fn track_favorite_updates_only_the_selected_layout() {
         let mut catalog = Catalog {
             tracks: vec![
                 CatalogItem {
@@ -423,7 +527,10 @@ mod tests {
             ],
             ..Catalog::default()
         };
-        catalog.set_favorite("track", "track", true).unwrap();
-        assert!(catalog.tracks.iter().all(|track| track.favorite));
+        catalog
+            .set_favorite("track", "track/layout_a", true)
+            .unwrap();
+        assert!(catalog.tracks[0].favorite);
+        assert!(!catalog.tracks[1].favorite);
     }
 }

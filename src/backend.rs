@@ -13,6 +13,7 @@ pub mod ffi {
         #[qproperty(bool, scanning)]
         #[qproperty(bool, installation_found)]
         #[qproperty(bool, launching)]
+        #[qproperty(bool, race_running)]
         #[qproperty(bool, control_capture_active)]
         #[qproperty(bool, control_monitoring)]
         #[qproperty(bool, content_busy)]
@@ -74,12 +75,34 @@ pub mod ffi {
         fn discover(self: Pin<&mut Self>);
 
         #[qinvokable]
+        #[cxx_name = "refreshRaceState"]
+        fn refresh_race_state(self: Pin<&mut Self>);
+
+        #[qinvokable]
+        #[cxx_name = "stopRace"]
+        fn stop_race(self: Pin<&mut Self>);
+
+        #[qinvokable]
         #[cxx_name = "launchExistingSession"]
         fn launch_existing_session(self: Pin<&mut Self>);
 
         #[qinvokable]
+        #[cxx_name = "launchConfiguration"]
+        fn launch_configuration(
+            self: Pin<&mut Self>,
+            car_id: &QString,
+            skin_id: &QString,
+            track_key: &QString,
+            conditions_json: &QString,
+        );
+
+        #[qinvokable]
         #[cxx_name = "toggleFavorite"]
         fn toggle_favorite(self: Pin<&mut Self>, kind: &QString, id: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "toggleDashboardItem"]
+        fn toggle_dashboard_item(self: Pin<&mut Self>, kind: &QString, id: &QString);
 
         #[qinvokable]
         #[cxx_name = "savePreset"]
@@ -255,6 +278,8 @@ pub struct BackendRust {
     scanning: bool,
     installation_found: bool,
     launching: bool,
+    race_running: bool,
+    race_state_busy: bool,
     control_capture_active: bool,
     control_monitoring: bool,
     content_busy: bool,
@@ -325,6 +350,8 @@ impl Default for BackendRust {
             scanning: false,
             installation_found: false,
             launching: false,
+            race_running: false,
+            race_state_busy: false,
             control_capture_active: false,
             control_monitoring: false,
             content_busy: false,
@@ -627,6 +654,7 @@ impl ffi::Backend {
                             Some(installation.clone());
                         backend.as_mut().rust_mut().get_mut().catalog = catalog;
                         backend.as_mut().rust_mut().get_mut().preferences = preferences;
+                        crate::ipc::notify_dashboard();
                     }
                     Err(error) => {
                         log::warn!("Assetto Corsa discovery failed: {error:#}");
@@ -698,6 +726,9 @@ impl ffi::Backend {
         password: &QString,
         car: &QString,
     ) {
+        if *self.launching() {
+            return;
+        }
         let Some(installation) = self.rust().installation.clone() else {
             return;
         };
@@ -711,16 +742,51 @@ impl ffi::Backend {
                 .set_error_message(QString::from("Online server is no longer available"));
             return;
         };
-        match online::configure_join(
-            &installation,
-            &server,
-            &car.to_string(),
-            &password.to_string(),
-        ) {
-            Ok(()) => self.as_mut().launch_existing_session(),
-            Err(error) => {
-                set_operation_error(self.as_mut(), "Could not configure online session", error)
+        let car = car.to_string();
+        let password = password.to_string();
+        self.as_mut().set_launching(true);
+        self.as_mut().set_error_message(QString::default());
+        self.as_mut()
+            .set_status(QString::from("Configuring and joining server..."));
+        let qt_thread = self.qt_thread();
+        if let Err(error) = runtime::spawn(async move {
+            let locked = match tokio::task::spawn_blocking(move || {
+                let session_lock = configuration::lock_session(&installation)?;
+                online::configure_join(&installation, &server, &car, &password)?;
+                Ok::<_, anyhow::Error>((installation, session_lock))
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!(
+                    "online configuration worker failed: {error}"
+                )),
+            };
+            let result = match locked {
+                Ok((installation, session_lock)) => {
+                    let result = launcher::launch_existing_session(&installation).await;
+                    drop(session_lock);
+                    result
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = qt_thread.queue(move |mut backend| {
+                backend.as_mut().set_launching(false);
+                match result {
+                    Ok(_) => backend
+                        .as_mut()
+                        .set_status(QString::from("Assetto Corsa is running")),
+                    Err(error) => {
+                        set_operation_error(backend.as_mut(), "Could not join online server", error)
+                    }
+                }
+            }) {
+                log::error!("could not return online launch result to Qt: {error}");
             }
+        }) {
+            self.as_mut().set_launching(false);
+            self.as_mut()
+                .set_error_message(QString::from(error.to_string()));
         }
     }
 
@@ -739,7 +805,23 @@ impl ffi::Backend {
             .set_status(QString::from("Starting showroom..."));
         let qt_thread = self.qt_thread();
         if let Err(error) = runtime::spawn(async move {
-            let result = launcher::launch_showroom(&installation, &car, &skin).await;
+            let locked = match tokio::task::spawn_blocking(move || {
+                let session_lock = configuration::lock_session(&installation)?;
+                Ok::<_, anyhow::Error>((installation, session_lock))
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!("showroom launch worker failed: {error}")),
+            };
+            let result = match locked {
+                Ok((installation, session_lock)) => {
+                    let result = launcher::launch_showroom(&installation, &car, &skin).await;
+                    drop(session_lock);
+                    result
+                }
+                Err(error) => Err(error),
+            };
             if let Err(error) = qt_thread.queue(move |mut backend| {
                 backend.as_mut().set_launching(false);
                 match result {
@@ -1049,6 +1131,91 @@ impl ffi::Backend {
         }
     }
 
+    pub fn refresh_race_state(mut self: Pin<&mut Self>) {
+        if self.rust().race_state_busy {
+            return;
+        }
+        self.as_mut().rust_mut().get_mut().race_state_busy = true;
+        let qt_thread = self.qt_thread();
+        if let Err(error) = runtime::spawn(async move {
+            let result = tokio::task::spawn_blocking(launcher::race_is_running).await;
+            if let Err(error) = qt_thread.queue(move |mut backend| {
+                backend.as_mut().rust_mut().get_mut().race_state_busy = false;
+                match result {
+                    Ok(Ok(running)) => backend.as_mut().set_race_running(running),
+                    Ok(Err(error)) => {
+                        log::warn!("could not inspect Assetto Corsa process state: {error:#}")
+                    }
+                    Err(error) => log::warn!("race state worker failed: {error}"),
+                }
+            }) {
+                log::error!("could not return race process state to Qt: {error}");
+            }
+        }) {
+            self.as_mut().rust_mut().get_mut().race_state_busy = false;
+            log::warn!("could not start race state worker: {error:#}");
+        }
+    }
+
+    pub fn stop_race(mut self: Pin<&mut Self>) {
+        if *self.launching() {
+            return;
+        }
+        let Some(installation) = self.rust().installation.clone() else {
+            self.as_mut()
+                .set_error_message(QString::from("No Assetto Corsa installation is selected"));
+            return;
+        };
+        self.as_mut().set_launching(true);
+        self.as_mut()
+            .set_status(QString::from("Stopping Assetto Corsa..."));
+        self.as_mut().set_error_message(QString::default());
+        let qt_thread = self.qt_thread();
+        if let Err(error) = runtime::spawn(async move {
+            let locked = match tokio::task::spawn_blocking(move || {
+                let session_lock = configuration::lock_session(&installation)?;
+                Ok::<_, anyhow::Error>(session_lock)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!("stop worker failed: {error}")),
+            };
+            let result = match locked {
+                Ok(session_lock) => {
+                    let result = launcher::stop_race().await;
+                    drop(session_lock);
+                    result
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = qt_thread.queue(move |mut backend| {
+                backend.as_mut().set_launching(false);
+                match result {
+                    Ok(()) => {
+                        backend.as_mut().set_race_running(false);
+                        backend
+                            .as_mut()
+                            .set_status(QString::from("Assetto Corsa stopped"));
+                    }
+                    Err(error) => {
+                        backend.as_mut().set_status(QString::from("Stop failed"));
+                        backend
+                            .as_mut()
+                            .set_error_message(QString::from(format!("{error:#}")));
+                    }
+                }
+            }) {
+                log::error!("could not return stop result to Qt: {error}");
+            }
+        }) {
+            self.as_mut().set_launching(false);
+            self.as_mut().set_status(QString::from("Stop failed"));
+            self.as_mut()
+                .set_error_message(QString::from(error.to_string()));
+        }
+    }
+
     pub fn launch_existing_session(mut self: Pin<&mut Self>) {
         if *self.launching() {
             return;
@@ -1067,11 +1234,110 @@ impl ffi::Backend {
 
         let qt_thread = self.qt_thread();
         if let Err(error) = runtime::spawn(async move {
-            let result = launcher::launch_existing_session(&installation).await;
+            let locked = match tokio::task::spawn_blocking(move || {
+                let session_lock = configuration::lock_session(&installation)?;
+                Ok::<_, anyhow::Error>((installation, session_lock))
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!("session launch worker failed: {error}")),
+            };
+            let result = match locked {
+                Ok((installation, session_lock)) => {
+                    let result = launcher::launch_existing_session(&installation).await;
+                    drop(session_lock);
+                    result
+                }
+                Err(error) => Err(error),
+            };
             if let Err(error) = qt_thread.queue(move |mut backend| {
                 backend.as_mut().set_launching(false);
                 match result {
                     Ok(process_id) => {
+                        backend.as_mut().set_race_running(true);
+                        backend
+                            .as_mut()
+                            .set_status(QString::from("Assetto Corsa is running"));
+                        log::info!("started Steam runtime launcher process {process_id}");
+                    }
+                    Err(error) => {
+                        backend.as_mut().set_status(QString::from("Launch failed"));
+                        backend
+                            .as_mut()
+                            .set_error_message(QString::from(format!("{error:#}")));
+                        log::error!("could not launch Assetto Corsa: {error:#}");
+                    }
+                }
+            }) {
+                log::error!("could not return launch result to Qt: {error}");
+            }
+        }) {
+            self.as_mut().set_launching(false);
+            self.as_mut().set_status(QString::from("Launch failed"));
+            self.as_mut()
+                .set_error_message(QString::from(error.to_string()));
+        }
+    }
+
+    pub fn launch_configuration(
+        mut self: Pin<&mut Self>,
+        car_id: &QString,
+        skin_id: &QString,
+        track_key: &QString,
+        conditions_json: &QString,
+    ) {
+        if *self.launching() {
+            return;
+        }
+        let Some(installation) = self.rust().installation.clone() else {
+            self.as_mut()
+                .set_error_message(QString::from("No Assetto Corsa installation is selected"));
+            return;
+        };
+        let car_id = car_id.to_string();
+        let skin_id = skin_id.to_string();
+        let track_key = track_key.to_string();
+        let conditions_json = conditions_json.to_string();
+
+        self.as_mut().set_launching(true);
+        self.as_mut().set_error_message(QString::default());
+        self.as_mut()
+            .set_status(QString::from("Configuring and starting session..."));
+
+        let qt_thread = self.qt_thread();
+        if let Err(error) = runtime::spawn(async move {
+            let locked = match tokio::task::spawn_blocking(move || {
+                let session_lock = configuration::lock_session(&installation)?;
+                configuration::apply_configuration_json_unlocked(
+                    &installation,
+                    &car_id,
+                    &skin_id,
+                    &track_key,
+                    &conditions_json,
+                )?;
+                Ok::<_, anyhow::Error>((installation, session_lock))
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::anyhow!(
+                    "session configuration worker failed: {error}"
+                )),
+            };
+            let result = match locked {
+                Ok((installation, session_lock)) => {
+                    let result = launcher::launch_existing_session(&installation).await;
+                    drop(session_lock);
+                    result
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = qt_thread.queue(move |mut backend| {
+                backend.as_mut().set_launching(false);
+                match result {
+                    Ok(process_id) => {
+                        backend.as_mut().set_race_running(true);
                         backend
                             .as_mut()
                             .set_status(QString::from("Assetto Corsa is running"));
@@ -1119,6 +1385,55 @@ impl ffi::Backend {
                 log::error!("could not update favorite: {error:#}");
                 self.as_mut()
                     .set_error_message(QString::from(format!("Could not save favorite: {error}")));
+            }
+        }
+    }
+
+    pub fn toggle_dashboard_item(mut self: Pin<&mut Self>, kind: &QString, id: &QString) {
+        let kind = kind.to_string();
+        let id = id.to_string();
+        let result = {
+            let rust = self.as_mut().rust_mut();
+            let rust = rust.get_mut();
+            if rust.installation.is_none() {
+                Err(anyhow::anyhow!("Assetto Corsa discovery is not complete"))
+            } else if !rust.catalog.contains(&kind, &id) {
+                Err(anyhow::anyhow!("catalog item not found: {id}"))
+            } else {
+                rust.preferences
+                    .toggle_dashboard_item(&kind, &id)
+                    .and_then(|selected| {
+                        rust.catalog.set_dashboard(&kind, &id, selected)?;
+                        Ok(selected)
+                    })
+            }
+        };
+
+        match result {
+            Ok(selected) => {
+                let (cars_json, tracks_json) = {
+                    let rust = self.rust();
+                    (
+                        text(&rust.catalog.cars_json),
+                        text(&rust.catalog.tracks_json),
+                    )
+                };
+                self.as_mut().set_cars_json(cars_json);
+                self.as_mut().set_tracks_json(tracks_json);
+                self.as_mut().set_status(QString::from(if selected {
+                    "Added to race dashboard"
+                } else {
+                    "Removed from race dashboard"
+                }));
+                self.as_mut().set_error_message(QString::default());
+                crate::ipc::notify_dashboard();
+            }
+            Err(error) => {
+                self.as_mut()
+                    .set_status(QString::from("Dashboard choices unchanged"));
+                self.as_mut().set_error_message(QString::from(format!(
+                    "Could not update dashboard choices: {error}"
+                )));
             }
         }
     }

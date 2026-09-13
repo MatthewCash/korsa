@@ -13,6 +13,9 @@ pub struct Preferences {
     #[serde(default)]
     pub favorite_tracks: BTreeSet<String>,
     #[serde(default)]
+    pub dashboard_cars: BTreeSet<String>,
+    #[serde(default)]
+    pub dashboard_tracks: BTreeSet<String>,
     pub presets: Vec<SessionPreset>,
 }
 
@@ -105,7 +108,7 @@ impl Preferences {
             .context("preferences path has no parent directory")?;
         fs::create_dir_all(parent)
             .with_context(|| format!("could not create {}", parent.display()))?;
-        let temporary = path.with_extension("json.tmp");
+        let temporary = path.with_extension(format!("json.tmp.{}", std::process::id()));
         let contents = serde_json::to_string_pretty(self)
             .context("could not serialize application preferences")?;
         fs::write(&temporary, contents)
@@ -129,6 +132,42 @@ impl Preferences {
         self.save()?;
         Ok(favorite)
     }
+
+    pub fn toggle_dashboard_item(&mut self, kind: &str, id: &str) -> Result<bool> {
+        let previous = match kind {
+            "car" => self.dashboard_cars.clone(),
+            "track" => self.dashboard_tracks.clone(),
+            _ => anyhow::bail!("unknown dashboard item type: {kind}"),
+        };
+        let mut updated = previous.clone();
+        let selected = toggle_limited(&mut updated, id.to_owned())?;
+        match kind {
+            "car" => self.dashboard_cars = updated,
+            "track" => self.dashboard_tracks = updated,
+            _ => unreachable!(),
+        }
+        if let Err(error) = self.save() {
+            match kind {
+                "car" => self.dashboard_cars = previous,
+                "track" => self.dashboard_tracks = previous,
+                _ => unreachable!(),
+            }
+            return Err(error);
+        }
+        Ok(selected)
+    }
+}
+
+fn toggle_limited<T: Ord>(items: &mut BTreeSet<T>, item: T) -> Result<bool> {
+    if items.remove(&item) {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        items.len() < 3,
+        "the dashboard supports at most three choices"
+    );
+    items.insert(item);
+    Ok(true)
 }
 
 fn path() -> Result<PathBuf> {
@@ -152,8 +191,24 @@ pub fn atomic_write(path: &Path, contents: &str) -> Result<()> {
         .parent()
         .context("configuration path has no parent directory")?;
     fs::create_dir_all(parent).with_context(|| format!("could not create {}", parent.display()))?;
-    let temporary = path.with_extension("tmp");
+    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
     fs::write(&temporary, contents)
         .with_context(|| format!("could not write {}", temporary.display()))?;
     fs::rename(&temporary, path).with_context(|| format!("could not replace {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dashboard_choices_are_limited_to_three() {
+        let mut choices = BTreeSet::new();
+        assert!(toggle_limited(&mut choices, "one").unwrap());
+        assert!(toggle_limited(&mut choices, "two").unwrap());
+        assert!(toggle_limited(&mut choices, "three").unwrap());
+        assert!(toggle_limited(&mut choices, "four").is_err());
+        assert!(!toggle_limited(&mut choices, "two").unwrap());
+        assert!(toggle_limited(&mut choices, "four").unwrap());
+    }
 }
