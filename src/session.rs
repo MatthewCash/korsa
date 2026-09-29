@@ -123,7 +123,7 @@ pub(crate) fn file_url(path: &Path) -> String {
     }
 }
 
-fn first_existing(paths: &[std::path::PathBuf]) -> String {
+pub(crate) fn first_existing(paths: &[std::path::PathBuf]) -> String {
     paths
         .iter()
         .find(|path| path.is_file())

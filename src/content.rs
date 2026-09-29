@@ -338,7 +338,10 @@ fn load_tracks(
                 id,
                 name,
                 subtitle,
-                preview: session::file_url(&layout_root.join("preview.png")),
+                preview: session::first_existing(&[
+                    layout_root.join("preview.png"),
+                    ui_root.join("preview.png"),
+                ]),
                 author: session::json_string(&metadata, "author").unwrap_or_default(),
                 description: plain_text(
                     &session::json_string(&metadata, "description").unwrap_or_default(),

@@ -104,6 +104,25 @@ QPixmap pixmapFromUrl(const QString &value, const QSize &size)
     return pixmap;
 }
 
+QPixmap trackPixmap(const QJsonObject &track, const QSize &size)
+{
+    QPixmap preview = pixmapFromUrl(track.value("preview").toString(), size);
+    const QSize outlineSize(qRound(size.width() * 0.42), qRound(size.height() * 0.72));
+    const QPixmap outline = pixmapFromUrl(track.value("outline").toString(), outlineSize);
+    if (outline.isNull()) return preview;
+
+    QPixmap combined(size);
+    combined.fill(Qt::transparent);
+    QPainter painter(&combined);
+    if (!preview.isNull()) {
+        painter.drawPixmap((size.width() - preview.width()) / 2,
+                           (size.height() - preview.height()) / 2, preview);
+    }
+    painter.drawPixmap(size.width() - outline.width() - 6,
+                       size.height() - outline.height() - 6, outline);
+    return combined;
+}
+
 QString humanizeTrackId(QString id)
 {
     if (id.startsWith(QStringLiteral("ks_"))) id.remove(0, 3);
@@ -495,6 +514,8 @@ private:
         header->addWidget(favoritesOnly);
         auto *list = new QListWidget;
         list->setViewMode(QListView::IconMode);
+        list->setMovement(QListView::Static);
+        list->setDragDropMode(QAbstractItemView::NoDragDrop);
         list->setResizeMode(QListView::Adjust);
         list->setIconSize(QSize(190, 108));
         list->setGridSize(QSize(235, 184));
@@ -512,6 +533,10 @@ private:
         auto *detailTitle = new QLabel;
         QFont detailFont = detailTitle->font(); detailFont.setPointSize(detailFont.pointSize() + 4); detailFont.setBold(true); detailTitle->setFont(detailFont); detailTitle->setWordWrap(true);
         auto *layoutChoice = new QComboBox;
+        if (!cars) {
+            layoutChoice->setIconSize(QSize(144, 81));
+            layoutChoice->setMinimumHeight(88);
+        }
         auto *detailText = new QLabel;
         detailText->setWordWrap(true);
         detailText->setTextInteractionFlags(Qt::TextSelectableByMouse);
@@ -1029,6 +1054,15 @@ private:
         for (QJsonObject &group : groups) {
             const QString fallback = humanizeTrackId(group.value("base_id").toString());
             group["name"] = sharedTrackName(group.value("layouts").toArray(), fallback);
+            if (group.value("preview").toString().isEmpty()) {
+                for (const auto &value : group.value("layouts").toArray()) {
+                    const QString preview = value.toObject().value("preview").toString();
+                    if (!preview.isEmpty()) {
+                        group["preview"] = preview;
+                        break;
+                    }
+                }
+            }
         }
         return groups;
     }
@@ -1136,10 +1170,7 @@ private:
                 text = object.value("name").toString() + tr("\n%1 layout(s)").arg(layouts);
                 if (!object.value("author").toString().isEmpty()) text += tr(" | by %1").arg(object.value("author").toString());
             }
-            const QString image = cars || object.value("outline").toString().isEmpty()
-                ? object.value("preview").toString()
-                : object.value("outline").toString();
-            auto *item = new QListWidgetItem(QIcon(pixmapFromUrl(image, QSize(220, 125))), text);
+            auto *item = new QListWidgetItem(QIcon(pixmapFromUrl(object.value("preview").toString(), QSize(220, 125))), text);
             item->setData(Qt::UserRole, object);
             item->setData(Qt::UserRole + 1, QString::fromUtf8(QJsonDocument(object).toJson(QJsonDocument::Compact)));
             item->setToolTip(object.value("favorite").toBool() ? tr("Favorite") : object.value("subtitle").toString());
@@ -1190,7 +1221,14 @@ private:
         const QJsonArray choices = object.value(cars ? "variants" : "layouts").toArray();
         for (const auto &value : choices) {
             const QJsonObject choice = value.toObject();
-            catalog.layouts->addItem(choice.value("name").toString(), choice);
+            if (cars) {
+                catalog.layouts->addItem(choice.value("name").toString(), choice);
+            } else {
+                catalog.layouts->addItem(
+                    QIcon(trackPixmap(choice, QSize(144, 81))),
+                    choice.value("name").toString(), choice
+                );
+            }
         }
         catalog.layouts->setVisible(choices.size() > 1);
         const QString current = cars ? selectedCar_ : selectedTrack_;
@@ -1210,10 +1248,7 @@ private:
         if (catalog.selected.isEmpty()) return;
         QJsonObject object = catalog.selected;
         if (catalog.layouts->currentIndex() >= 0) object = catalog.layouts->currentData().toJsonObject();
-        const QString image = cars || object.value("outline").toString().isEmpty()
-            ? object.value("preview").toString()
-            : object.value("outline").toString();
-        catalog.image->setPixmap(pixmapFromUrl(image, QSize(430, 240)));
+        catalog.image->setPixmap(pixmapFromUrl(object.value("preview").toString(), QSize(430, 240)));
         catalog.title->setText(object.value("name").toString());
         QStringList details;
         const QList<QPair<QString, QString>> values = cars
@@ -1355,10 +1390,7 @@ private:
             trackLayout_->clear();
             for (const auto &value : layouts) {
                 const QJsonObject layout = value.toObject();
-                const QString image = layout.value("outline").toString().isEmpty()
-                    ? layout.value("preview").toString()
-                    : layout.value("outline").toString();
-                trackLayout_->addItem(QIcon(pixmapFromUrl(image, QSize(144, 81))),
+                trackLayout_->addItem(QIcon(trackPixmap(layout, QSize(144, 81))),
                                       layout.value("name").toString(), layout);
             }
         }
@@ -1392,11 +1424,9 @@ private:
         for (const auto &value : tracks_) {
             const QJsonObject track = value.toObject();
             if (track.value("id").toString() != selectedTrack_) continue;
-            if (!track.value("outline").toString().isEmpty()) return track.value("outline").toString();
             if (!track.value("preview").toString().isEmpty()) return track.value("preview").toString();
         }
-        const QString outline = textProperty(backend_, "track_outline");
-        return outline.isEmpty() ? textProperty(backend_, "track_preview") : outline;
+        return textProperty(backend_, "track_preview");
     }
 
     Backend *backend_;
