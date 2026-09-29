@@ -39,6 +39,7 @@
 #include <QPainter>
 #include <QPushButton>
 #include <QPixmapCache>
+#include <QResizeEvent>
 #include <QScrollArea>
 #include <QSet>
 #include <QSignalBlocker>
@@ -160,11 +161,13 @@ double catalogNumber(const QString &value)
     return number.toDouble();
 }
 
-QWidget *scrollPage(QWidget *content)
+QScrollArea *scrollPage(QWidget *content)
 {
     auto *area = new QScrollArea;
     area->setWidgetResizable(true);
     area->setFrameShape(QFrame::NoFrame);
+    area->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    content->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     area->setWidget(content);
     return area;
 }
@@ -232,6 +235,12 @@ private:
         int controller{-1};
         int button{-1};
     };
+
+    void resizeEvent(QResizeEvent *event) override
+    {
+        QMainWindow::resizeEvent(event);
+        updateDriveLayout();
+    }
 
     void buildShell()
     {
@@ -322,7 +331,8 @@ private:
         header->addStretch();
         layout->addLayout(header);
 
-        auto *selection = new QHBoxLayout;
+        driveSelection_ = new QGridLayout;
+        auto *selection = driveSelection_;
         selection->setSpacing(12);
 
         auto *carColumn = new QVBoxLayout;
@@ -346,9 +356,8 @@ private:
         skin_->setMinimumHeight(88);
         carColumn->addWidget(skinLabel);
         carColumn->addWidget(skin_);
-        auto *carWidget = new QWidget;
-        carWidget->setLayout(carColumn);
-        selection->addWidget(carWidget, 1);
+        driveCarPanel_ = new QWidget;
+        driveCarPanel_->setLayout(carColumn);
 
         auto *trackColumn = new QVBoxLayout;
         trackColumn->setSpacing(4);
@@ -365,9 +374,8 @@ private:
         trackLayout_->setMinimumHeight(88);
         trackColumn->addWidget(trackLayoutLabel);
         trackColumn->addWidget(trackLayout_);
-        auto *trackWidget = new QWidget;
-        trackWidget->setLayout(trackColumn);
-        selection->addWidget(trackWidget, 1);
+        driveTrackPanel_ = new QWidget;
+        driveTrackPanel_->setLayout(trackColumn);
 
         auto *launchPanel = new QGroupBox(tr("Ready to race"));
         launchPanel->setMinimumWidth(225);
@@ -385,7 +393,12 @@ private:
         launchLayout->addWidget(launchSummary_, 1);
         launchLayout->addWidget(driveButton_);
         launchLayout->addWidget(showroom);
-        selection->addWidget(launchPanel);
+        driveLaunchPanel_ = launchPanel;
+        selection->addWidget(driveCarPanel_, 0, 0);
+        selection->addWidget(driveTrackPanel_, 0, 1);
+        selection->addWidget(driveLaunchPanel_, 0, 2);
+        selection->setColumnStretch(0, 1);
+        selection->setColumnStretch(1, 1);
         layout->addLayout(selection);
 
         auto *setup = new QGroupBox(tr("Quick Setup"));
@@ -410,22 +423,26 @@ private:
         air_ = spin(-40, 60); road_ = spin(-40, 100);
         conditionForm->addRow(tr("Weather"), weather_);
         auto *timeRow = new QWidget;
-        auto *timeLayout = new QHBoxLayout(timeRow); timeLayout->setContentsMargins(0, 0, 0, 0);
-        timeLayout->addWidget(time_);
+        driveTimeLayout_ = new QGridLayout(timeRow);
+        driveTimeLayout_->setContentsMargins(0, 0, 0, 0);
+        driveTimeLayout_->addWidget(time_, 0, 0);
         for (const auto &[label, hour] : QList<QPair<QString, int>>{{tr("Dawn"), 6}, {tr("Noon"), 12}, {tr("Sunset"), 18}, {tr("Midnight"), 0}}) {
             auto *button = new QToolButton; button->setText(label);
             connect(button, &QToolButton::clicked, this, [this, hour] { time_->setTime(QTime(hour, 0)); scheduleApply(); });
-            timeLayout->addWidget(button);
+            driveTimeButtons_.append(button);
+            driveTimeLayout_->addWidget(button, 0, driveTimeButtons_.size());
         }
         conditionForm->addRow(tr("Start time"), timeRow);
         conditionForm->addRow(tr("Air temperature"), sliderControl(air_)); conditionForm->addRow(tr("Road temperature"), sliderControl(road_));
-        auto *quickPanels = new QHBoxLayout;
-        quickPanels->setSpacing(12);
-        quickPanels->addWidget(setup, 1);
-        quickPanels->addWidget(conditions, 1);
-        layout->addLayout(quickPanels);
+        driveQuickPanels_ = new QBoxLayout(QBoxLayout::LeftToRight);
+        driveQuickPanels_->setSpacing(12);
+        driveQuickPanels_->addWidget(setup, 1);
+        driveQuickPanels_->addWidget(conditions, 1);
+        layout->addLayout(driveQuickPanels_);
         layout->addStretch();
-        stack_->addWidget(scrollPage(content));
+        driveScroll_ = scrollPage(content);
+        stack_->addWidget(driveScroll_);
+        QTimer::singleShot(0, this, [this] { updateDriveLayout(); });
 
         for (auto *combo : {mode_, weather_}) connect(combo, &QComboBox::activated, this, [this] { scheduleApply(); });
         connect(skin_, &QComboBox::activated, this, [this] { selectedSkin_ = skin_->currentData().toString(); scheduleApply(); });
@@ -443,6 +460,48 @@ private:
         for (auto *box : {opponents_, ai_, laps_, duration_, air_, road_}) connect(box, &QSpinBox::valueChanged, this, [this] { scheduleApply(); });
         connect(time_, &QTimeEdit::timeChanged, this, [this] { scheduleApply(); });
         connect(penalties_, &QCheckBox::toggled, this, [this] { scheduleApply(); });
+    }
+
+    void updateDriveLayout()
+    {
+        if (!driveScroll_) return;
+        const int width = driveScroll_->viewport()->width();
+        const int layoutMode = width >= 900 ? 0 : width >= 800 ? 1
+            : width >= 700 ? 2 : width >= 560 ? 3 : 4;
+        if (layoutMode == driveLayoutMode_) return;
+        driveLayoutMode_ = layoutMode;
+
+        driveSelection_->removeWidget(driveCarPanel_);
+        driveSelection_->removeWidget(driveTrackPanel_);
+        driveSelection_->removeWidget(driveLaunchPanel_);
+        if (width >= 900) {
+            driveSelection_->addWidget(driveCarPanel_, 0, 0);
+            driveSelection_->addWidget(driveTrackPanel_, 0, 1);
+            driveSelection_->addWidget(driveLaunchPanel_, 0, 2);
+        } else if (width >= 560) {
+            driveSelection_->addWidget(driveCarPanel_, 0, 0);
+            driveSelection_->addWidget(driveTrackPanel_, 0, 1);
+            driveSelection_->addWidget(driveLaunchPanel_, 1, 0, 1, 2);
+        } else {
+            driveSelection_->addWidget(driveCarPanel_, 0, 0);
+            driveSelection_->addWidget(driveTrackPanel_, 1, 0);
+            driveSelection_->addWidget(driveLaunchPanel_, 2, 0);
+        }
+
+        driveQuickPanels_->setDirection(width >= 800
+            ? QBoxLayout::LeftToRight : QBoxLayout::TopToBottom);
+
+        driveTimeLayout_->removeWidget(time_);
+        for (auto *button : driveTimeButtons_) driveTimeLayout_->removeWidget(button);
+        if (width >= 700) {
+            driveTimeLayout_->addWidget(time_, 0, 0);
+            for (int index = 0; index < driveTimeButtons_.size(); ++index)
+                driveTimeLayout_->addWidget(driveTimeButtons_.at(index), 0, index + 1);
+        } else {
+            driveTimeLayout_->addWidget(time_, 0, 0, 1, 2);
+            for (int index = 0; index < driveTimeButtons_.size(); ++index)
+                driveTimeLayout_->addWidget(driveTimeButtons_.at(index), 1 + index / 2, index % 2);
+        }
     }
 
     QSpinBox *spin(int minimum, int maximum)
@@ -1431,6 +1490,7 @@ private:
 
     Backend *backend_;
     QListWidget *navigation_{}; QStackedWidget *stack_{}; QLabel *statusLabel_{}; QLabel *cspLabel_{}; QProgressBar *busy_{};
+    QScrollArea *driveScroll_{}; QGridLayout *driveSelection_{}; QBoxLayout *driveQuickPanels_{}; QGridLayout *driveTimeLayout_{}; QWidget *driveCarPanel_{}; QWidget *driveTrackPanel_{}; QWidget *driveLaunchPanel_{}; QVector<QToolButton *> driveTimeButtons_; int driveLayoutMode_{-1};
     QToolButton *carPreview_{}; QToolButton *trackPreview_{}; QLabel *launchSummary_{}; QPushButton *driveButton_{}; QAction *driveAction_{}; QComboBox *mode_{}; QComboBox *carVariant_{}; QComboBox *skin_{}; QComboBox *trackLayout_{}; QComboBox *weather_{}; QSpinBox *opponents_{}; QSpinBox *ai_{}; QSpinBox *laps_{}; QSpinBox *duration_{}; QSpinBox *air_{}; QSpinBox *road_{}; QCheckBox *penalties_{}; QTimeEdit *time_{};
     QListWidget *carList_{}; QListWidget *trackList_{}; QListWidget *replayList_{}; QLineEdit *carSearch_{}; QLineEdit *trackSearch_{}; QLabel *carCountLabel_{}; QLabel *trackCountLabel_{};
     CatalogWidgets carCatalog_, trackCatalog_;
