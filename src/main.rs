@@ -76,6 +76,7 @@ fn main() -> Result<()> {
         ),
     }
 
+    let _dbus_connection = tokio_runtime.block_on(ipc::start())?;
     log::info!("starting AC Linux Manager");
     let exit_code = backend::run_widgets_application();
     anyhow::ensure!(

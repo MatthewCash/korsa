@@ -654,7 +654,7 @@ impl ffi::Backend {
                             Some(installation.clone());
                         backend.as_mut().rust_mut().get_mut().catalog = catalog;
                         backend.as_mut().rust_mut().get_mut().preferences = preferences;
-                        crate::ipc::notify_dashboard();
+                        crate::ipc::notify_dashboard_options_changed();
                     }
                     Err(error) => {
                         log::warn!("Assetto Corsa discovery failed: {error:#}");
@@ -1426,7 +1426,7 @@ impl ffi::Backend {
                     "Removed from race dashboard"
                 }));
                 self.as_mut().set_error_message(QString::default());
-                crate::ipc::notify_dashboard();
+                crate::ipc::notify_dashboard_options_changed();
             }
             Err(error) => {
                 self.as_mut()

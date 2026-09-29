@@ -21,6 +21,7 @@ sha2 = "0.10"
 tokio = { version = "1.53.0", features = ["process", "rt-multi-thread", "sync", "time"] }
 url = "2"
 zip = { version = "8", default-features = false, features = ["deflate"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [build-dependencies]
 cxx-qt-build = { version = "0.9.1", features = ["link_qt_object_files"] }
