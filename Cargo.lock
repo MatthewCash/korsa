@@ -3,28 +3,6 @@
 version = 4
 
 [[package]]
-name = "ac-linux-manager"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cxx",
- "cxx-qt",
- "cxx-qt-build",
- "cxx-qt-lib",
- "env_logger",
- "libc",
- "log",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "url",
- "zbus",
- "zip",
-]
-
-[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1178,6 +1156,28 @@ dependencies = [
  "cfg-if",
  "futures-util",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "korsa"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cxx",
+ "cxx-qt",
+ "cxx-qt-build",
+ "cxx-qt-lib",
+ "env_logger",
+ "libc",
+ "log",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "url",
+ "zbus",
+ "zip",
 ]
 
 [[package]]

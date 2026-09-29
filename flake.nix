@@ -1,5 +1,5 @@
 {
-  description = "AC Linux Manager development environment";
+  description = "Korsa development environment";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -12,7 +12,7 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           qt = pkgs.symlinkJoin {
-            name = "aclm-qt";
+            name = "korsa-qt";
             paths = with pkgs.kdePackages; [
               kirigami
               kwindowsystem
@@ -24,7 +24,7 @@
               qtdeclarative.dev
             ];
           };
-          qmake = pkgs.writeShellScript "aclm-qmake" ''
+          qmake = pkgs.writeShellScript "korsa-qmake" ''
             ${pkgs.kdePackages.qtbase}/bin/qmake "$@" \
               | ${pkgs.gnused}/bin/sed \
                   -e 's|${pkgs.kdePackages.qtbase.dev}|${qt}|g' \
@@ -32,7 +32,7 @@
           '';
         in {
           default = pkgs.rustPlatform.buildRustPackage {
-            pname = "ac-linux-manager";
+            pname = "korsa";
             version = "0.1.0";
             src = pkgs.lib.cleanSource ./.;
 
@@ -50,8 +50,8 @@
             ];
 
             QMAKE = qmake;
-            ACLM_KWINDOWSYSTEM_INCLUDE_DIR = "${pkgs.kdePackages.kwindowsystem.dev}/include/KF6";
-            ACLM_KWINDOWSYSTEM_LIBRARY_DIR = "${pkgs.kdePackages.kwindowsystem}/lib";
+            KORSA_KWINDOWSYSTEM_INCLUDE_DIR = "${pkgs.kdePackages.kwindowsystem.dev}/include/KF6";
+            KORSA_KWINDOWSYSTEM_LIBRARY_DIR = "${pkgs.kdePackages.kwindowsystem}/lib";
 
             preBuild = ''
               export QMAKE=${qmake}
@@ -63,7 +63,7 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           qt = pkgs.symlinkJoin {
-            name = "aclm-qt";
+            name = "korsa-qt";
             paths = with pkgs.kdePackages; [
               kirigami
               kwindowsystem
@@ -75,7 +75,7 @@
               qtdeclarative.dev
             ];
           };
-          qmake = pkgs.writeShellScript "aclm-qmake" ''
+          qmake = pkgs.writeShellScript "korsa-qmake" ''
             ${pkgs.kdePackages.qtbase}/bin/qmake "$@" \
               | ${pkgs.gnused}/bin/sed \
                   -e 's|${pkgs.kdePackages.qtbase.dev}|${qt}|g' \
@@ -100,8 +100,8 @@
             ];
 
             RUSTFLAGS = "-C link-arg=-fuse-ld=lld -C link-arg=-Wl,-rpath,${pkgs.lib.makeLibraryPath [ qt pkgs.kdePackages.kwindowsystem pkgs.stdenv.cc.cc.lib ]}";
-            ACLM_KWINDOWSYSTEM_INCLUDE_DIR = "${pkgs.kdePackages.kwindowsystem.dev}/include/KF6";
-            ACLM_KWINDOWSYSTEM_LIBRARY_DIR = "${pkgs.kdePackages.kwindowsystem}/lib";
+            KORSA_KWINDOWSYSTEM_INCLUDE_DIR = "${pkgs.kdePackages.kwindowsystem.dev}/include/KF6";
+            KORSA_KWINDOWSYSTEM_LIBRARY_DIR = "${pkgs.kdePackages.kwindowsystem}/lib";
 
             shellHook = ''
               export QMAKE=${qmake}

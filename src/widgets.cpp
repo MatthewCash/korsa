@@ -1,6 +1,6 @@
 #include "widgets.h"
 
-#include "ac-linux-manager/src/backend.cxxqt.h"
+#include "korsa/src/backend.cxxqt.h"
 #include "window_effects.h"
 
 #include <QApplication>
@@ -177,7 +177,7 @@ public:
     explicit MainWindow(Backend *backend)
         : backend_(backend)
     {
-        setWindowTitle(QStringLiteral("AC Linux Manager"));
+        setWindowTitle(QStringLiteral("Korsa"));
         resize(1280, 820);
         setMinimumSize(980, 650);
         buildShell();
@@ -1512,12 +1512,12 @@ private:
 int run_aclm_widgets()
 {
     int argc = 1;
-    char name[] = "ac-linux-manager";
+    char name[] = "korsa";
     char *argv[] = {name, nullptr};
     QApplication application(argc, argv);
-    application.setApplicationName(QStringLiteral("AC Linux Manager"));
-    application.setOrganizationName(QStringLiteral("AC Linux Manager"));
-    application.setWindowIcon(QIcon(QStringLiteral(":/icons/ac-linux-manager.svg")));
+    application.setApplicationName(QStringLiteral("Korsa"));
+    application.setOrganizationName(QStringLiteral("Korsa"));
+    application.setWindowIcon(QIcon(QStringLiteral(":/icons/korsa.svg")));
     QPixmapCache::setCacheLimit(128 * 1024);
     Backend backend;
     MainWindow window(&backend);

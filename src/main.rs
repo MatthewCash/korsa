@@ -18,7 +18,7 @@ mod setups;
 
 use anyhow::{Context, Result};
 fn main() -> Result<()> {
-    cxx_qt::init_crate!(ac_linux_manager);
+    cxx_qt::init_crate!(korsa);
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -72,12 +72,12 @@ fn main() -> Result<()> {
         }
         [] => {}
         _ => anyhow::bail!(
-            "usage: ac-linux-manager [--launch-last | --dashboard-json | --race-running | --stop-race | --dashboard-launch CAR TRACK START_MINUTES]"
+            "usage: korsa [--launch-last | --dashboard-json | --race-running | --stop-race | --dashboard-launch CAR TRACK START_MINUTES]"
         ),
     }
 
     let _dbus_connection = tokio_runtime.block_on(ipc::start())?;
-    log::info!("starting AC Linux Manager");
+    log::info!("starting Korsa");
     let exit_code = backend::run_widgets_application();
     anyhow::ensure!(
         exit_code == 0,

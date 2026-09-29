@@ -44,7 +44,7 @@ pub fn releases_json(releases: &[Release]) -> Result<String> {
 
 pub async fn download(installation: &Installation, version: &str) -> Result<PathBuf> {
     validate_version(version)?;
-    let root = installation.game_root.join(".ac-linux-manager/downloads");
+    let root = installation.game_root.join(".korsa/downloads");
     fs::create_dir_all(&root)?;
     let destination = root.join(format!("lights-patch-v{version}.zip"));
     let temporary = destination.with_extension("zip.part");

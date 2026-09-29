@@ -1,6 +1,6 @@
-# AC Linux Manager
+# Korsa
 
-AC Linux Manager is a native Linux launcher and content manager for Assetto Corsa.
+Korsa is a native Assetto Corsa companion for Linux.
 
 The current milestone provides a native, Kvantum-painted KDE dashboard with KWin blur and contrast, metadata-rich car and track catalogs, visual car skin/livery and session-mode selection, AI grids and race details, persisted favorites, reusable session and controller presets, live quick and advanced track-condition editing with time shortcuts, searchable Assetto Corsa and CSP settings, a dedicated wheel/gamepad/keyboard assignment workflow, a visual in-game app layout editor, validated car/track/CSP ZIP installation with backups and rollback, official Kunos lobby browsing and joining, native showroom launch, local car setup management, safe asynchronous Steam discovery, and direct launch through Steam Linux Runtime and Proton.
 

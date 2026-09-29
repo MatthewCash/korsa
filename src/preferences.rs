@@ -172,17 +172,11 @@ fn toggle_limited<T: Ord>(items: &mut BTreeSet<T>, item: T) -> Result<bool> {
 
 fn path() -> Result<PathBuf> {
     if let Some(root) = env::var_os("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(root)
-            .join("ac-linux-manager")
-            .join("preferences.json"));
+        return Ok(PathBuf::from(root).join("korsa").join("preferences.json"));
     }
     env::var_os("HOME")
         .map(PathBuf::from)
-        .map(|home| {
-            home.join(".config")
-                .join("ac-linux-manager")
-                .join("preferences.json")
-        })
+        .map(|home| home.join(".config").join("korsa").join("preferences.json"))
         .context("neither XDG_CONFIG_HOME nor HOME is set")
 }
 

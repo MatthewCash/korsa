@@ -1,10 +1,10 @@
 use cxx_qt_build::CxxQtBuilder;
 
 fn main() {
-    let include_dir = std::env::var("ACLM_KWINDOWSYSTEM_INCLUDE_DIR")
-        .expect("ACLM_KWINDOWSYSTEM_INCLUDE_DIR must point to KWindowSystem headers");
-    let library_dir = std::env::var("ACLM_KWINDOWSYSTEM_LIBRARY_DIR")
-        .expect("ACLM_KWINDOWSYSTEM_LIBRARY_DIR must point to KWindowSystem libraries");
+    let include_dir = std::env::var("KORSA_KWINDOWSYSTEM_INCLUDE_DIR")
+        .expect("KORSA_KWINDOWSYSTEM_INCLUDE_DIR must point to KWindowSystem headers");
+    let library_dir = std::env::var("KORSA_KWINDOWSYSTEM_LIBRARY_DIR")
+        .expect("KORSA_KWINDOWSYSTEM_LIBRARY_DIR must point to KWindowSystem libraries");
 
     unsafe {
         CxxQtBuilder::new()

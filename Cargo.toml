@@ -1,8 +1,8 @@
 [package]
-name = "ac-linux-manager"
+name = "korsa"
 version = "0.1.0"
 edition = "2024"
-description = "A native Linux launcher and content manager for Assetto Corsa"
+description = "A native Assetto Corsa companion for Linux"
 license = "GPL-3.0-only"
 build = "build.rs"
 

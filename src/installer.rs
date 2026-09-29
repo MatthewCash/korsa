@@ -149,7 +149,7 @@ pub fn inspect(
         };
         validate_relative_path(&destination)?;
         ensure!(
-            !destination.starts_with(".ac-linux-manager"),
+            !destination.starts_with(".korsa"),
             "archive targets manager metadata"
         );
         components.insert(component);
@@ -316,9 +316,7 @@ fn write_record(transaction: &Path, record: &InstallRecord) -> Result<()> {
 }
 
 fn transaction_root(installation: &Installation) -> PathBuf {
-    installation
-        .game_root
-        .join(".ac-linux-manager/transactions")
+    installation.game_root.join(".korsa/transactions")
 }
 
 fn transaction_id() -> Result<String> {

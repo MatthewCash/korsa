@@ -8,17 +8,17 @@ use zbus::{
     object_server::{InterfaceRef, SignalEmitter},
 };
 
-pub const SERVICE_NAME: &str = "com.matthewcash.ACLinuxManager";
-pub const OBJECT_PATH: &str = "/com/matthewcash/ACLinuxManager";
+pub const SERVICE_NAME: &str = "com.matthewcash.Korsa";
+pub const OBJECT_PATH: &str = "/com/matthewcash/Korsa";
 const PROTOCOL_VERSION: u32 = 1;
 const RACE_STATUS_INTERVAL: Duration = Duration::from_millis(500);
 
 static CONNECTION: OnceLock<Connection> = OnceLock::new();
 
-pub struct AcLinuxManager;
+pub struct Korsa;
 
-#[interface(name = "com.matthewcash.ACLinuxManager")]
-impl AcLinuxManager {
+#[interface(name = "com.matthewcash.Korsa")]
+impl Korsa {
     fn get_protocol_version(&self) -> u32 {
         PROTOCOL_VERSION
     }
@@ -84,13 +84,13 @@ impl AcLinuxManager {
 pub async fn start() -> Result<Connection> {
     let connection = Builder::session()?
         .name(SERVICE_NAME)?
-        .serve_at(OBJECT_PATH, AcLinuxManager)?
+        .serve_at(OBJECT_PATH, Korsa)?
         .build()
         .await
-        .context("could not start AC Linux Manager D-Bus service")?;
+        .context("could not start Korsa D-Bus service")?;
     CONNECTION
         .set(connection.clone())
-        .map_err(|_| anyhow::anyhow!("AC Linux Manager D-Bus service was already initialized"))?;
+        .map_err(|_| anyhow::anyhow!("Korsa D-Bus service was already initialized"))?;
 
     let monitor_connection = connection.clone();
     runtime::spawn(async move { monitor_race_state(monitor_connection).await })?;
@@ -137,7 +137,7 @@ async fn monitor_race_state(connection: Connection) {
     }
 }
 
-async fn interface(connection: &Connection) -> zbus::Result<InterfaceRef<AcLinuxManager>> {
+async fn interface(connection: &Connection) -> zbus::Result<InterfaceRef<Korsa>> {
     connection.object_server().interface(OBJECT_PATH).await
 }
 

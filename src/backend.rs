@@ -2,7 +2,7 @@
 pub mod ffi {
     unsafe extern "C++" {
         include!("cxx-qt-lib/qstring.h");
-        include!("ac-linux-manager/src/widgets.h");
+        include!("korsa/src/widgets.h");
         type QString = cxx_qt_lib::QString;
 
         fn run_aclm_widgets() -> i32;
