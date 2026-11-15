@@ -11,6 +11,7 @@ mod discovery;
 mod installer;
 mod ipc;
 mod launcher;
+mod liveries;
 mod online;
 mod preferences;
 mod runtime;

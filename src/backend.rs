@@ -61,6 +61,7 @@ pub mod ffi {
         #[qproperty(QString, weather_json)]
         #[qproperty(QString, weather_controllers_json)]
         #[qproperty(QString, conditions_json)]
+        #[qproperty(QString, external_session_revision)]
         #[qproperty(QString, presets_json)]
         #[qproperty(i32, car_count)]
         #[qproperty(i32, track_count)]
@@ -275,6 +276,8 @@ use std::{
 };
 
 pub struct BackendRust {
+    session_revision_seen: u64,
+    external_session_revision: QString,
     scanning: bool,
     installation_found: bool,
     launching: bool,
@@ -347,6 +350,8 @@ pub struct BackendRust {
 impl Default for BackendRust {
     fn default() -> Self {
         Self {
+            session_revision_seen: 0,
+            external_session_revision: QString::default(),
             scanning: false,
             installation_found: false,
             launching: false,
@@ -440,6 +445,7 @@ impl ffi::Backend {
         if let Err(error) = runtime::spawn(async move {
             let result = tokio::task::spawn_blocking(|| {
                 let installation = discovery::discover()?;
+                let session_revision = crate::ipc::session_revision();
                 let (session, session_error) = match session::load(&installation) {
                     Ok(session) => (Some(session), None),
                     Err(error) => {
@@ -511,6 +517,7 @@ impl ffi::Backend {
                     app_layout_json,
                     csp_settings_json,
                     tyre_blankets,
+                    session_revision,
                 ))
             })
             .await;
@@ -548,6 +555,7 @@ impl ffi::Backend {
                         app_layout_json,
                         csp_settings_json,
                         tyre_blankets,
+                        session_revision,
                     )) => {
                         let documents_ready =
                             discovery::validate_documents_root(&installation).is_ok();
@@ -654,6 +662,7 @@ impl ffi::Backend {
                             Some(installation.clone());
                         backend.as_mut().rust_mut().get_mut().catalog = catalog;
                         backend.as_mut().rust_mut().get_mut().preferences = preferences;
+                        backend.as_mut().rust_mut().get_mut().session_revision_seen = session_revision;
                         crate::ipc::notify_dashboard_options_changed();
                     }
                     Err(error) => {
@@ -1136,15 +1145,59 @@ impl ffi::Backend {
             return;
         }
         self.as_mut().rust_mut().get_mut().race_state_busy = true;
+        let revision = crate::ipc::session_revision();
+        let installation = if revision != self.rust().session_revision_seen && !*self.scanning() {
+            self.rust().installation.clone()
+        } else {
+            None
+        };
         let qt_thread = self.qt_thread();
         if let Err(error) = runtime::spawn(async move {
-            let result = tokio::task::spawn_blocking(launcher::race_is_running).await;
+            let result = tokio::task::spawn_blocking(move || {
+                let running = launcher::race_is_running();
+                let selected = installation.map(|installation| {
+                    Ok::<_, anyhow::Error>((
+                        session::load(&installation)?,
+                        configuration::load_conditions(&installation)?,
+                    ))
+                });
+                (running, selected)
+            })
+            .await;
             if let Err(error) = qt_thread.queue(move |mut backend| {
                 backend.as_mut().rust_mut().get_mut().race_state_busy = false;
                 match result {
-                    Ok(Ok(running)) => backend.as_mut().set_race_running(running),
-                    Ok(Err(error)) => {
-                        log::warn!("could not inspect Assetto Corsa process state: {error:#}")
+                    Ok((running, selected)) => {
+                        match running {
+                            Ok(running) => backend.as_mut().set_race_running(running),
+                            Err(error) => log::warn!(
+                                "could not inspect Assetto Corsa process state: {error:#}"
+                            ),
+                        }
+                        // Discard a read overtaken by another UI write. The next
+                        // tick retries the latest revision without resetting edits.
+                        if revision == crate::ipc::session_revision() && !*backend.scanning() {
+                            match selected {
+                                Some(Ok((session, conditions))) => {
+                                    log::debug!("synchronized dashboard selection revision {revision}: {} at {}",
+                                        session.car_id, session.track_id);
+                                    apply_session(backend.as_mut(), &session);
+                                    backend.as_mut().rust_mut().get_mut().session_revision_seen =
+                                        revision;
+                                    refresh_setups(backend.as_mut());
+                                    if let Ok(json) = configuration::conditions_json(&conditions) {
+                                        backend.as_mut().set_conditions_json(text(&json));
+                                    }
+                                    backend
+                                        .as_mut()
+                                        .set_external_session_revision(text(&revision.to_string()));
+                                }
+                                Some(Err(error)) => {
+                                    log::warn!("could not synchronize session selection: {error:#}")
+                                }
+                                None => {}
+                            }
+                        }
                     }
                     Err(error) => log::warn!("race state worker failed: {error}"),
                 }
@@ -1290,6 +1343,10 @@ impl ffi::Backend {
         if *self.launching() {
             return;
         }
+        if self.rust().session_revision_seen != crate::ipc::session_revision() {
+            self.as_mut().refresh_race_state();
+            return;
+        }
         let Some(installation) = self.rust().installation.clone() else {
             self.as_mut()
                 .set_error_message(QString::from("No Assetto Corsa installation is selected"));
@@ -1299,6 +1356,7 @@ impl ffi::Backend {
         let skin_id = skin_id.to_string();
         let track_key = track_key.to_string();
         let conditions_json = conditions_json.to_string();
+        let expected_revision = self.rust().session_revision_seen;
 
         self.as_mut().set_launching(true);
         self.as_mut().set_error_message(QString::default());
@@ -1309,6 +1367,10 @@ impl ffi::Backend {
         if let Err(error) = runtime::spawn(async move {
             let locked = match tokio::task::spawn_blocking(move || {
                 let session_lock = configuration::lock_session(&installation)?;
+                anyhow::ensure!(
+                    expected_revision == crate::ipc::session_revision(),
+                    "session selection changed; refresh before launching"
+                );
                 configuration::apply_configuration_json_unlocked(
                     &installation,
                     &car_id,
@@ -1489,15 +1551,17 @@ impl ffi::Backend {
                 .as_ref()
                 .context("Assetto Corsa installation is unavailable");
             installation.and_then(|installation| {
-                let conditions =
-                    configuration::apply_preset(installation, &rust.preferences, &id.to_string())?;
-                let session = session::load(installation)?;
-                Ok::<_, anyhow::Error>((conditions, session))
+                configuration::apply_preset(installation, &rust.preferences, &id.to_string())
             })
         };
         match result {
-            Ok((conditions, session)) => {
+            Ok(configuration::AppliedSession {
+                conditions,
+                session,
+                revision,
+            }) => {
                 apply_session(self.as_mut(), &session);
+                self.as_mut().rust_mut().get_mut().session_revision_seen = revision;
                 refresh_setups(self.as_mut());
                 if let Ok(json) = configuration::conditions_json(&conditions) {
                     self.as_mut().set_conditions_json(text(&json));
@@ -1517,26 +1581,36 @@ impl ffi::Backend {
         track_key: &QString,
         conditions_json: &QString,
     ) {
+        // A debounced widget edit can still refer to the session shown before
+        // a dashboard click. Refresh instead of writing that stale snapshot back.
+        if self.rust().session_revision_seen != crate::ipc::session_revision() {
+            self.as_mut().refresh_race_state();
+            return;
+        }
         let result = {
             let rust = self.rust();
             rust.installation
                 .as_ref()
                 .context("Assetto Corsa installation is unavailable")
                 .and_then(|installation| {
-                    let conditions = configuration::apply_configuration_json(
+                    configuration::apply_configuration_json(
                         installation,
                         &car_id.to_string(),
                         &skin_id.to_string(),
                         &track_key.to_string(),
                         &conditions_json.to_string(),
-                    )?;
-                    let session = session::load(installation)?;
-                    Ok::<_, anyhow::Error>((conditions, session))
+                        rust.session_revision_seen,
+                    )
                 })
         };
         match result {
-            Ok((conditions, session)) => {
+            Ok(configuration::AppliedSession {
+                conditions,
+                session,
+                revision,
+            }) => {
                 apply_session(self.as_mut(), &session);
+                self.as_mut().rust_mut().get_mut().session_revision_seen = revision;
                 refresh_setups(self.as_mut());
                 if let Ok(json) = configuration::conditions_json(&conditions) {
                     self.as_mut().set_conditions_json(text(&json));
@@ -2062,6 +2136,21 @@ fn path_string(path: &std::path::Path) -> QString {
 }
 
 fn apply_session(mut backend: Pin<&mut ffi::Backend>, session: &session::SessionInfo) {
+    let cars_json = {
+        let rust = backend.as_mut().rust_mut();
+        let rust = rust.get_mut();
+        match rust.catalog.set_livery(&session.car_id, &session.skin_id) {
+            Ok(true) => Some(text(&rust.catalog.cars_json)),
+            Ok(false) => None,
+            Err(error) => {
+                log::warn!("could not update catalog livery: {error}");
+                None
+            }
+        }
+    };
+    if let Some(json) = cars_json {
+        backend.as_mut().set_cars_json(json);
+    }
     backend.as_mut().set_session_loaded(true);
     backend.as_mut().set_car_name(text(&session.car_name));
     backend.as_mut().set_car_brand(text(&session.car_brand));

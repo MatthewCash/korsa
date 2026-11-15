@@ -64,6 +64,28 @@ device connected. Do not copy instance IDs between machines or hardcode them:
 Wine can recycle them for different devices. Live settings input uses Linux
 joysticks; the pre-launch check independently validates the identities AC uses.
 
+## Race dashboard synchronization
+
+The dashboard supports six pinned cars and six pinned track layouts in 3×2 grids. Dashboard
+clicks save the selected car, track, or time immediately, without starting AC;
+the main window follows the saved session within its next refresh (about one
+second). Main-window edits and presets also notify the dashboard. Selections
+outside the pinned choices remain active without falsely highlighting a different
+choice. Selection requests are serialized so rapid clicks cannot apply out of
+order. START launches the saved shared session instead of reapplying a cached
+client selection. D-Bus protocol version 2 adds `SetDashboardSelection`,
+`LaunchSelectedSession`, `SessionChanged`, and
+the active `selection` in `GetDashboardOptions`; update Korsa and the dashboard
+client together.
+
+Korsa remembers the last livery used for each car in
+`cfg/korsa-liveries.json` inside that installation's Assetto Corsa Documents
+directory. Switching cars (including variants and dashboard selections) restores
+that car's livery; an explicit livery choice or session preset takes precedence.
+The outgoing car's existing livery is remembered on the first switch too. If a
+remembered skin was removed, Korsa uses an installed fallback instead. Dashboard
+thumbnails show each car's current/remembered livery, with its name in the tooltip.
+
 ## Project Direction
 
 1. Add skin selection and structured car specifications.

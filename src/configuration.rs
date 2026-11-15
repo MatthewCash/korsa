@@ -1,5 +1,6 @@
 use crate::{
     discovery::Installation,
+    liveries::{Liveries, installed_skins},
     preferences::{self, Conditions, Preferences, SessionPreset},
     session,
 };
@@ -255,11 +256,27 @@ pub fn delete_preset(preferences: &mut Preferences, id: &str) -> Result<()> {
     preferences.save()
 }
 
+pub struct AppliedSession {
+    pub conditions: Conditions,
+    pub session: session::SessionInfo,
+    pub revision: u64,
+}
+
+impl AppliedSession {
+    fn load(installation: &Installation, conditions: Conditions) -> Result<Self> {
+        Ok(Self {
+            conditions,
+            session: session::load(installation)?,
+            revision: crate::ipc::session_revision(),
+        })
+    }
+}
+
 pub fn apply_preset(
     installation: &Installation,
     preferences: &Preferences,
     id: &str,
-) -> Result<Conditions> {
+) -> Result<AppliedSession> {
     let _lock = try_lock_session(installation)?;
     let preset = preferences
         .presets
@@ -273,7 +290,7 @@ pub fn apply_preset(
         &track_key(&preset.track_id, &preset.track_layout),
         &preset.conditions,
     )?;
-    Ok(preset.conditions.clone())
+    AppliedSession::load(installation, preset.conditions.clone())
 }
 
 pub fn apply_configuration_json(
@@ -282,9 +299,21 @@ pub fn apply_configuration_json(
     skin_id: &str,
     track_key: &str,
     conditions_json: &str,
-) -> Result<Conditions> {
+    expected_revision: u64,
+) -> Result<AppliedSession> {
     let _lock = try_lock_session(installation)?;
-    apply_configuration_json_unlocked(installation, car_id, skin_id, track_key, conditions_json)
+    anyhow::ensure!(
+        expected_revision == crate::ipc::session_revision(),
+        "session selection changed; refresh before applying edits"
+    );
+    let conditions = apply_configuration_json_unlocked(
+        installation,
+        car_id,
+        skin_id,
+        track_key,
+        conditions_json,
+    )?;
+    AppliedSession::load(installation, conditions)
 }
 
 pub fn apply_configuration_json_unlocked(
@@ -329,19 +358,52 @@ pub fn apply_dashboard_configuration(
         "track is not installed: {track_key}"
     );
 
-    let session = session::load(installation)?;
-    let skins = installed_skins(installation, car_id);
-    let skin_id = if session.car_id == car_id && skins.contains(&session.skin_id) {
-        session.skin_id
-    } else {
-        skins
-            .first()
-            .cloned()
-            .context("selected car has no installed skins")?
-    };
     let mut conditions = load_conditions(installation)?;
     conditions.sun_angle = (f64::from(start_minutes) / 60.0 - 13.0) * 16.0;
-    apply_configuration(installation, car_id, &skin_id, track_key, &conditions)
+    apply_configuration(installation, car_id, "", track_key, &conditions)
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct DashboardSelection {
+    pub car_id: String,
+    pub track_key: String,
+    pub start_minutes: i32,
+}
+
+pub fn dashboard_selection(installation: &Installation) -> Result<DashboardSelection> {
+    let path = installation.documents_root.join("cfg/race.ini");
+    let contents =
+        fs::read_to_string(&path).with_context(|| format!("could not read {}", path.display()))?;
+    let angle = value(&contents, "LIGHTING", "SUN_ANGLE", "0")
+        .parse::<f64>()
+        .context("invalid session sun angle")?;
+    anyhow::ensure!(angle.is_finite(), "invalid session sun angle");
+    Ok(DashboardSelection {
+        car_id: value(&contents, "RACE", "MODEL", ""),
+        track_key: track_key(
+            &value(&contents, "RACE", "TRACK", ""),
+            &value(&contents, "RACE", "CONFIG_TRACK", ""),
+        ),
+        start_minutes: (((angle / 16.0 + 13.0) * 60.0).round() as i32).rem_euclid(1440),
+    })
+}
+
+/// Change one field against the latest saved session, not a client's stale copy.
+/// The caller holds the session lock, just as for dashboard launch.
+pub fn set_dashboard_selection(installation: &Installation, kind: &str, id: &str) -> Result<()> {
+    let mut selection = dashboard_selection(installation)?;
+    match kind {
+        "car" => selection.car_id = id.to_owned(),
+        "track" => selection.track_key = id.to_owned(),
+        "time" => selection.start_minutes = id.parse().context("invalid dashboard start time")?,
+        _ => anyhow::bail!("unknown dashboard selection type: {kind}"),
+    }
+    apply_dashboard_configuration(
+        installation,
+        &selection.car_id,
+        &selection.track_key,
+        selection.start_minutes,
+    )
 }
 
 fn apply_configuration(
@@ -354,6 +416,15 @@ fn apply_configuration(
     let path = installation.documents_root.join("cfg/race.ini");
     let mut contents =
         fs::read_to_string(&path).with_context(|| format!("could not read {}", path.display()))?;
+    let original = contents.clone();
+    let current = session::load(installation)?;
+    let mut liveries = Liveries::load(installation)?;
+    let skins = installed_skins(installation, car_id);
+    let selected_skin = liveries
+        .resolve(car_id, &skins, Some(skin_id), Some(&current))
+        .context("selected car has no installed skins")?
+        .to_owned();
+    let skin_id = selected_skin.as_str();
     let (track_id, track_layout) = split_track_key(selected_track);
     let (session_name, session_type, drift_mode) = session_mode(&conditions.session_mode)?;
     anyhow::ensure!(
@@ -489,25 +560,21 @@ fn apply_configuration(
             contents = set_ini_value(&contents, &section, key, &value);
         }
     }
-    preferences::atomic_write(&path, &contents)
-}
-
-fn installed_skins(installation: &Installation, car_id: &str) -> Vec<String> {
-    let root = installation
-        .game_root
-        .join("content/cars")
-        .join(car_id)
-        .join("skins");
-    let Ok(entries) = fs::read_dir(root) else {
-        return Vec::new();
-    };
-    let mut skins = entries
-        .flatten()
-        .filter(|entry| entry.path().is_dir())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    skins.sort();
-    skins
+    preferences::atomic_write(&path, &contents)?;
+    // Seed the outgoing car too: its current livery may predate this feature.
+    if !current.car_id.is_empty()
+        && installed_skins(installation, &current.car_id).contains(&current.skin_id)
+    {
+        liveries.remember(&current.car_id, &current.skin_id);
+    }
+    liveries.remember(car_id, skin_id);
+    if let Err(error) = liveries.save(installation) {
+        preferences::atomic_write(&path, &original)
+            .context("could not restore race.ini after failing to save livery history")?;
+        return Err(error);
+    }
+    crate::ipc::notify_session_changed();
+    Ok(())
 }
 
 fn session_mode(mode: &str) -> Result<(&'static str, i32, i32)> {
@@ -699,6 +766,159 @@ mod tests {
         let output = fs::read_to_string(installation.documents_root.join("cfg/race.ini")).unwrap();
         assert!(output.contains("RACE_LAPS=12"));
         assert!(output.contains("SUN_ANGLE=80"));
+
+        // A dashboard click changes only the requested field against current
+        // saved state, preserving skin, conditions, and previous choices.
+        fs::create_dir_all(
+            installation
+                .game_root
+                .join("content/cars/other_car/skins/green"),
+        )
+        .unwrap();
+        fs::create_dir_all(installation.game_root.join("content/tracks/other_track")).unwrap();
+        // Simulate upgrading with an existing livery but no per-car history yet.
+        fs::remove_file(installation.documents_root.join("cfg/korsa-liveries.json")).unwrap();
+        let revision = crate::ipc::session_revision();
+        set_dashboard_selection(&installation, "car", "other_car").unwrap();
+        assert!(crate::ipc::session_revision() > revision);
+        assert_eq!(
+            dashboard_selection(&installation).unwrap(),
+            DashboardSelection {
+                car_id: "other_car".into(),
+                track_key: "test_track/layout".into(),
+                start_minutes: 1080,
+            }
+        );
+        assert_eq!(session::load(&installation).unwrap().skin_id, "green");
+        set_dashboard_selection(&installation, "track", "other_track").unwrap();
+        set_dashboard_selection(&installation, "time", "0").unwrap();
+        assert_eq!(
+            dashboard_selection(&installation).unwrap(),
+            DashboardSelection {
+                car_id: "other_car".into(),
+                track_key: "other_track".into(),
+                start_minutes: 0,
+            }
+        );
+        let preserved = load_conditions(&installation).unwrap();
+        assert_eq!(preserved.race_laps, 12);
+        assert_eq!(preserved.ai_level, 94);
+        assert_eq!(preserved.opponents, 2);
+        assert!(preserved.penalties);
+
+        // Switching via the main window sends an empty skin, while an explicit
+        // livery/preset passes its skin. Both paths share the same persisted map.
+        set_dashboard_selection(&installation, "car", "test_car").unwrap();
+        assert_eq!(session::load(&installation).unwrap().skin_id, "red");
+        apply_configuration_json_unlocked(
+            &installation,
+            "test_car",
+            "blue",
+            "other_track",
+            &conditions_json(&conditions).unwrap(),
+        )
+        .unwrap();
+        set_dashboard_selection(&installation, "car", "other_car").unwrap();
+        apply_configuration_json_unlocked(
+            &installation,
+            "test_car",
+            "",
+            "other_track",
+            &conditions_json(&conditions).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(session::load(&installation).unwrap().skin_id, "blue");
+        // Explicit presets override the remembered blue skin, then become the
+        // new remembered choice. Removing that skin falls back to installed blue.
+        apply_configuration(&installation, "test_car", "red", "other_track", &conditions).unwrap();
+        set_dashboard_selection(&installation, "car", "other_car").unwrap();
+        set_dashboard_selection(&installation, "car", "test_car").unwrap();
+        assert_eq!(session::load(&installation).unwrap().skin_id, "red");
+        fs::remove_dir(
+            installation
+                .game_root
+                .join("content/cars/test_car/skins/red"),
+        )
+        .unwrap();
+        set_dashboard_selection(&installation, "car", "other_car").unwrap();
+        set_dashboard_selection(&installation, "car", "test_car").unwrap();
+        assert_eq!(session::load(&installation).unwrap().skin_id, "blue");
+        let before_error =
+            fs::read_to_string(installation.documents_root.join("cfg/race.ini")).unwrap();
+        for (kind, id) in [
+            ("time", "1440"),
+            ("time", "-1"),
+            ("car", "missing"),
+            ("track", "missing"),
+            ("unknown", "x"),
+        ] {
+            assert!(set_dashboard_selection(&installation, kind, id).is_err());
+            assert_eq!(
+                fs::read_to_string(installation.documents_root.join("cfg/race.ini")).unwrap(),
+                before_error
+            );
+        }
+        assert!(
+            apply_configuration_json(
+                &installation,
+                "test_car",
+                "red",
+                "test_track/layout",
+                &conditions_json(&conditions).unwrap(),
+                u64::MAX
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(installation.documents_root.join("cfg/race.ini")).unwrap(),
+            before_error
+        );
+
+        // A persistence failure must not leave the session switched without its
+        // promised history; invalid configuration must not change history either.
+        let history = installation.documents_root.join("cfg/korsa-liveries.json");
+        let saved_history = fs::read_to_string(&history).unwrap();
+        let invalid = Conditions {
+            race_laps: 0,
+            ..conditions.clone()
+        };
+        assert!(
+            apply_configuration(&installation, "other_car", "green", "other_track", &invalid)
+                .is_err()
+        );
+        assert_eq!(fs::read_to_string(&history).unwrap(), saved_history);
+        fs::create_dir_all(
+            installation
+                .game_root
+                .join("content/cars/other_car/skins/gold"),
+        )
+        .unwrap();
+        let blocked_temporary = history.with_extension(format!("tmp.{}", std::process::id()));
+        fs::create_dir(&blocked_temporary).unwrap();
+        assert!(
+            apply_configuration(
+                &installation,
+                "other_car",
+                "gold",
+                "other_track",
+                &conditions
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&history).unwrap(), saved_history);
+        assert_eq!(
+            fs::read_to_string(installation.documents_root.join("cfg/race.ini")).unwrap(),
+            before_error
+        );
+        fs::remove_dir(blocked_temporary).unwrap();
+        fs::rename(&history, history.with_extension("saved")).unwrap();
+        // An invalid history file is not silently replaced or forgotten.
+        fs::write(&history, "invalid JSON").unwrap();
+        assert!(set_dashboard_selection(&installation, "car", "other_car").is_err());
+        assert_eq!(
+            fs::read_to_string(installation.documents_root.join("cfg/race.ini")).unwrap(),
+            before_error
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

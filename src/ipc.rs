@@ -1,6 +1,12 @@
 use crate::{configuration, content, discovery, launcher, preferences, runtime};
 use anyhow::{Context, Result};
-use std::{sync::OnceLock, time::Duration};
+use std::{
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use zbus::{
     Connection,
     connection::Builder,
@@ -10,10 +16,11 @@ use zbus::{
 
 pub const SERVICE_NAME: &str = "com.matthewcash.Korsa";
 pub const OBJECT_PATH: &str = "/com/matthewcash/Korsa";
-const PROTOCOL_VERSION: u32 = 1;
+const PROTOCOL_VERSION: u32 = 2;
 const RACE_STATUS_INTERVAL: Duration = Duration::from_millis(500);
 
 static CONNECTION: OnceLock<Connection> = OnceLock::new();
+static SESSION_REVISION: AtomicU64 = AtomicU64::new(0);
 
 pub struct Korsa;
 
@@ -34,6 +41,31 @@ impl Korsa {
 
     fn get_race_running(&self) -> fdo::Result<bool> {
         launcher::race_is_running().map_err(method_error)
+    }
+
+    async fn set_dashboard_selection(&self, kind: String, id: String) -> fdo::Result<()> {
+        blocking(move || {
+            let installation = discovery::discover()?;
+            let _lock = configuration::lock_session(&installation)?;
+            configuration::set_dashboard_selection(&installation, &kind, &id)
+        })
+        .await
+    }
+
+    async fn launch_selected_session(&self) -> fdo::Result<()> {
+        let (installation, session_lock) = blocking(|| {
+            let installation = discovery::discover()?;
+            let session_lock = configuration::lock_session(&installation)?;
+            Ok((installation, session_lock))
+        })
+        .await?;
+        // Launch the shared source of truth, not a client's possibly stale
+        // car/track/time snapshot from before another UI changed the session.
+        let result = launcher::launch_existing_session(&installation)
+            .await
+            .map_err(method_error);
+        drop(session_lock);
+        result.map(|process_id| log::info!("started selected session as process {process_id}"))
     }
 
     async fn launch_dashboard_session(
@@ -78,6 +110,9 @@ impl Korsa {
     async fn dashboard_options_changed(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
 
     #[zbus(signal)]
+    async fn session_changed(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
+
+    #[zbus(signal)]
     async fn race_running_changed(emitter: &SignalEmitter<'_>, running: bool) -> zbus::Result<()>;
 }
 
@@ -112,6 +147,29 @@ pub fn notify_dashboard_options_changed() {
         }
     }) {
         log::warn!("could not queue race dashboard notification: {error}");
+    }
+}
+
+pub fn session_revision() -> u64 {
+    SESSION_REVISION.load(Ordering::Acquire)
+}
+
+pub fn notify_session_changed() {
+    SESSION_REVISION.fetch_add(1, Ordering::Release);
+    let Some(connection) = CONNECTION.get().cloned() else {
+        return;
+    };
+    if let Err(error) = runtime::spawn(async move {
+        match interface(&connection).await {
+            Ok(interface) => {
+                if let Err(error) = interface.session_changed().await {
+                    log::warn!("could not publish session selection: {error}");
+                }
+            }
+            Err(error) => log::warn!("could not access D-Bus interface: {error}"),
+        }
+    }) {
+        log::warn!("could not queue session selection notification: {error}");
     }
 }
 

@@ -1,4 +1,10 @@
-use crate::{discovery::Installation, preferences::Preferences, session};
+use crate::{
+    configuration,
+    discovery::Installation,
+    liveries::Liveries,
+    preferences::{DASHBOARD_CAPACITY, Preferences},
+    session,
+};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::{
@@ -60,10 +66,14 @@ struct SkinItem {
 }
 
 pub fn load(installation: &Installation, preferences: &Preferences) -> Result<Catalog> {
+    let liveries = Liveries::load(installation)?;
+    let current = session::load(installation).ok();
     let cars = load_cars(
         &installation.game_root.join("content/cars"),
         &preferences.favorite_cars,
         &preferences.dashboard_cars,
+        &liveries,
+        current.as_ref(),
     )?;
     let tracks = load_tracks(
         &installation.game_root.join("content/tracks"),
@@ -91,6 +101,8 @@ pub fn dashboard_json(installation: &Installation, preferences: &Preferences) ->
         cars: Vec<DashboardItem<'a>>,
         tracks: Vec<DashboardItem<'a>>,
         times: [DashboardTime; 4],
+        selection: configuration::DashboardSelection,
+        capacity: usize,
     }
 
     #[derive(Serialize)]
@@ -99,6 +111,8 @@ pub fn dashboard_json(installation: &Installation, preferences: &Preferences) ->
         name: &'a str,
         preview: &'a str,
         outline: &'a str,
+        skin: &'a str,
+        skin_name: &'a str,
     }
 
     #[derive(Serialize)]
@@ -109,6 +123,8 @@ pub fn dashboard_json(installation: &Installation, preferences: &Preferences) ->
 
     let catalog = load(installation, preferences)?;
     serde_json::to_string(&DashboardOptions {
+        selection: configuration::dashboard_selection(installation)?,
+        capacity: DASHBOARD_CAPACITY,
         cars: catalog
             .cars
             .iter()
@@ -118,6 +134,12 @@ pub fn dashboard_json(installation: &Installation, preferences: &Preferences) ->
                 name: &item.name,
                 preview: &item.preview,
                 outline: &item.outline,
+                skin: &item.skin,
+                skin_name: item
+                    .skins
+                    .iter()
+                    .find(|skin| skin.id == item.skin)
+                    .map_or("", |skin| skin.name.as_str()),
             })
             .collect(),
         tracks: catalog
@@ -129,6 +151,8 @@ pub fn dashboard_json(installation: &Installation, preferences: &Preferences) ->
                 name: &item.name,
                 preview: &item.preview,
                 outline: &item.outline,
+                skin: "",
+                skin_name: "",
             })
             .collect(),
         times: [
@@ -154,6 +178,22 @@ pub fn dashboard_json(installation: &Installation, preferences: &Preferences) ->
 }
 
 impl Catalog {
+    pub fn set_livery(&mut self, car_id: &str, skin_id: &str) -> Result<bool> {
+        let Some(car) = self.cars.iter_mut().find(|car| car.id == car_id) else {
+            return Ok(false);
+        };
+        let Some(skin) = car.skins.iter().find(|skin| skin.id == skin_id) else {
+            return Ok(false);
+        };
+        if car.skin == skin_id && car.preview == skin.preview {
+            return Ok(false);
+        }
+        car.skin = skin.id.clone();
+        car.preview = skin.preview.clone();
+        self.cars_json = serde_json::to_string(&self.cars)?;
+        Ok(true)
+    }
+
     pub fn contains(&self, kind: &str, id: &str) -> bool {
         match kind {
             "car" => &self.cars,
@@ -204,6 +244,8 @@ fn load_cars(
     root: &Path,
     favorites: &std::collections::BTreeSet<String>,
     dashboard: &std::collections::BTreeSet<String>,
+    liveries: &Liveries,
+    current: Option<&session::SessionInfo>,
 ) -> Result<Vec<CatalogItem>> {
     let mut cars = directories(root)?
         .into_iter()
@@ -225,17 +267,21 @@ fn load_cars(
                     Some(SkinItem {
                         id,
                         name,
-                        preview: session::file_url(&skin_root.join("preview.jpg")),
+                        preview: session::first_existing(&[
+                            skin_root.join("preview.jpg"),
+                            skin_root.join("preview.png"),
+                        ]),
                     })
                 })
                 .collect::<Vec<_>>();
-            let skin = skins
-                .first()
-                .map(|skin| skin.id.clone())
-                .unwrap_or_default();
+            let installed = skins.iter().map(|skin| skin.id.clone()).collect::<Vec<_>>();
+            let skin = liveries
+                .resolve(&id, &installed, None, current)
+                .unwrap_or_default()
+                .to_owned();
             let preview = skins
                 .iter()
-                .find(|skin| !skin.preview.is_empty())
+                .find(|candidate| candidate.id == skin)
                 .map(|skin| skin.preview.clone())
                 .unwrap_or_default();
             let tags = json_strings(&metadata, "tags");
@@ -497,6 +543,156 @@ mod tests {
     #[test]
     fn counts_catalog_items_for_frontend() {
         assert_eq!(count(&[]), 0);
+    }
+
+    #[test]
+    fn dashboard_and_catalog_previews_follow_each_cars_livery() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("korsa-livery-previews-{unique}"));
+        fs::create_dir_all(root.join("cfg")).unwrap();
+        fs::create_dir_all(root.join("content/tracks")).unwrap();
+        for car in ["car_a", "car_b"] {
+            for (skin, name, extension) in [
+                ("blue", "Blue Racing", "jpg"),
+                ("red", "Scarlet Racing", "png"),
+            ] {
+                let path = root.join(format!("content/cars/{car}/skins/{skin}"));
+                fs::create_dir_all(&path).unwrap();
+                fs::write(
+                    path.join("ui_skin.json"),
+                    format!(r#"{{"skinname":"{name}"}}"#),
+                )
+                .unwrap();
+                fs::write(path.join(format!("preview.{extension}")), "test image").unwrap();
+            }
+        }
+        fs::write(
+            root.join("cfg/race.ini"),
+            "[RACE]\nMODEL=car_b\nSKIN=blue\nTRACK=track\n",
+        )
+        .unwrap();
+        let installation = Installation {
+            steam_root: root.clone(),
+            library_root: root.clone(),
+            game_root: root.clone(),
+            proton_prefix: root.clone(),
+            documents_root: root.clone(),
+            proton_command: root.clone(),
+            proton_config: None,
+            runtime_root: root.clone(),
+            runtime_client: root.clone(),
+        };
+        let mut liveries = Liveries::default();
+        liveries.remember("car_a", "red");
+        liveries.remember("car_b", "red");
+        liveries.save(&installation).unwrap();
+        let preferences = Preferences {
+            dashboard_cars: ["car_a".into(), "car_b".into()].into(),
+            ..Default::default()
+        };
+        let options: serde_json::Value =
+            serde_json::from_str(&dashboard_json(&installation, &preferences).unwrap()).unwrap();
+        let cars = options["cars"].as_array().unwrap();
+        let a = cars.iter().find(|car| car["id"] == "car_a").unwrap();
+        let b = cars.iter().find(|car| car["id"] == "car_b").unwrap();
+        assert_eq!(a["skin"], "red");
+        assert_eq!(a["skin_name"], "Scarlet Racing");
+        assert!(a["preview"].as_str().unwrap().ends_with("red/preview.png"));
+        assert_eq!(
+            b["skin"], "blue",
+            "the active session takes precedence over old history"
+        );
+        assert!(b["preview"].as_str().unwrap().ends_with("blue/preview.jpg"));
+        assert_eq!(
+            session::load(&installation).unwrap().skin_name,
+            "Blue Racing"
+        );
+
+        let mut catalog = load(&installation, &preferences).unwrap();
+        assert!(catalog.set_livery("car_a", "blue").unwrap());
+        let a = catalog.cars.iter().find(|car| car.id == "car_a").unwrap();
+        assert_eq!(a.skin, "blue");
+        assert!(a.preview.ends_with("blue/preview.jpg"));
+        assert!(!catalog.set_livery("car_a", "blue").unwrap());
+        fs::remove_file(root.join("content/cars/car_a/skins/red/preview.png")).unwrap();
+        let catalog = load(&installation, &preferences).unwrap();
+        assert!(
+            catalog
+                .cars
+                .iter()
+                .find(|car| car.id == "car_a")
+                .unwrap()
+                .preview
+                .is_empty(),
+            "do not display a different livery when the selected skin has no preview"
+        );
+        fs::remove_dir_all(root.join("content/cars/car_a/skins/red")).unwrap();
+        let options: serde_json::Value =
+            serde_json::from_str(&dashboard_json(&installation, &preferences).unwrap()).unwrap();
+        let a = options["cars"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|car| car["id"] == "car_a")
+            .unwrap();
+        assert_eq!(a["skin"], "blue");
+        assert!(a["preview"].as_str().unwrap().ends_with("blue/preview.jpg"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dashboard_options_include_six_choices_and_the_actual_session() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("korsa-dashboard-{unique}"));
+        fs::create_dir_all(root.join("cfg")).unwrap();
+        let mut preferences = Preferences::default();
+        for index in 0..6 {
+            let car = format!("car{index}");
+            let track = format!("track{index}");
+            let car_ui = root.join(format!("content/cars/{car}/ui"));
+            let track_ui = root.join(format!("content/tracks/{track}/ui"));
+            fs::create_dir_all(&car_ui).unwrap();
+            fs::create_dir_all(&track_ui).unwrap();
+            fs::write(
+                car_ui.join("ui_car.json"),
+                format!(r#"{{"name":"Car {index}"}}"#),
+            )
+            .unwrap();
+            fs::write(
+                track_ui.join("ui_track.json"),
+                format!(r#"{{"name":"Track {index}"}}"#),
+            )
+            .unwrap();
+            preferences.dashboard_cars.insert(car);
+            preferences.dashboard_tracks.insert(track);
+        }
+        fs::write(root.join("cfg/race.ini"), "[RACE]\nMODEL=outside_pins\nTRACK=track4\nCONFIG_TRACK=layout\n[LIGHTING]\nSUN_ANGLE=-208\n").unwrap();
+        let installation = Installation {
+            steam_root: root.clone(),
+            library_root: root.clone(),
+            game_root: root.clone(),
+            proton_prefix: root.clone(),
+            documents_root: root.clone(),
+            proton_command: root.clone(),
+            proton_config: None,
+            runtime_root: root.clone(),
+            runtime_client: root.clone(),
+        };
+        let options: serde_json::Value =
+            serde_json::from_str(&dashboard_json(&installation, &preferences).unwrap()).unwrap();
+        assert_eq!(options["capacity"], 6);
+        assert_eq!(options["cars"].as_array().unwrap().len(), 6);
+        assert_eq!(options["tracks"].as_array().unwrap().len(), 6);
+        assert_eq!(options["selection"]["car_id"], "outside_pins");
+        assert_eq!(options["selection"]["track_key"], "track4/layout");
+        assert_eq!(options["selection"]["start_minutes"], 0);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

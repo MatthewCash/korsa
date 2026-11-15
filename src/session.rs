@@ -40,7 +40,13 @@ pub fn load(installation: &Installation) -> Result<SessionInfo> {
     let car_ui = read_optional(&car_root.join("ui/ui_car.json"));
     let car_name = json_string(&car_ui, "name").unwrap_or_else(|| humanize(&car_id));
     let car_brand = json_string(&car_ui, "brand").unwrap_or_default();
-    let car_preview = file_url(&car_root.join("skins").join(&skin_id).join("preview.jpg"));
+    let skin_root = car_root.join("skins").join(&skin_id);
+    let skin_metadata = read_optional(&skin_root.join("ui_skin.json"));
+    let skin_name = json_string(&skin_metadata, "skinname")
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| humanize(&skin_id));
+    let car_preview =
+        first_existing(&[skin_root.join("preview.jpg"), skin_root.join("preview.png")]);
 
     let track_root = installation
         .game_root
@@ -88,7 +94,7 @@ pub fn load(installation: &Installation) -> Result<SessionInfo> {
         car_brand,
         car_id,
         skin_id: skin_id.clone(),
-        skin_name: humanize(&skin_id),
+        skin_name,
         track_name,
         track_location,
         track_id,

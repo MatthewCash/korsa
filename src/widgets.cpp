@@ -445,12 +445,18 @@ private:
         QTimer::singleShot(0, this, [this] { updateDriveLayout(); });
 
         for (auto *combo : {mode_, weather_}) connect(combo, &QComboBox::activated, this, [this] { scheduleApply(); });
-        connect(skin_, &QComboBox::activated, this, [this] { selectedSkin_ = skin_->currentData().toString(); scheduleApply(); });
+        connect(skin_, &QComboBox::activated, this, [this] {
+            selectedSkin_ = skin_->currentData().toString();
+            // Commit before a quick car switch can replace this pending choice.
+            applyTimer_.stop();
+            applyDrive();
+        });
         connect(carVariant_, &QComboBox::activated, this, [this] {
             const QJsonObject variant = carVariant_->currentData().toJsonObject();
             if (variant.isEmpty()) return;
-            selectedCar_ = variant.value("id").toString();
-            selectedSkin_ = variant.value("skin").toString();
+            const QString car = variant.value("id").toString();
+            if (car != selectedCar_) selectedSkin_.clear();
+            selectedCar_ = car;
             scheduleApply();
         });
         connect(trackLayout_, &QComboBox::activated, this, [this] {
@@ -1041,6 +1047,13 @@ private:
 
     void refresh()
     {
+        const QString externalRevision = textProperty(backend_, "external_session_revision");
+        if (externalRevision != externalSessionRevision_) {
+            externalSessionRevision_ = externalRevision;
+            // An authoritative selection from the dash supersedes an older
+            // debounced local write. Programmatic refresh must not echo it back.
+            applyTimer_.stop();
+        }
         const bool contentBusy = boolProperty(backend_, "content_busy");
         const bool onlineBusy = boolProperty(backend_, "online_busy");
         const bool launching = boolProperty(backend_, "launching");
@@ -1328,8 +1341,9 @@ private:
         const QJsonObject choice = catalog.layouts->currentData().toJsonObject();
         if (choice.isEmpty()) return;
         if (cars) {
-            selectedCar_ = choice.value("id").toString();
-            selectedSkin_ = choice.value("skin").toString();
+            const QString car = choice.value("id").toString();
+            if (car != selectedCar_) selectedSkin_.clear();
+            selectedCar_ = car;
         } else {
             selectedTrack_ = choice.value("id").toString();
         }
@@ -1365,10 +1379,12 @@ private:
     void updateSkins()
     {
         QJsonArray skins;
+        QString displayedSkin = selectedSkin_;
         for (const auto &value : cars_) {
             const auto car = value.toObject();
             if (car.value("id").toString() == selectedCar_) {
                 skins = car.value("skins").toArray();
+                if (displayedSkin.isEmpty()) displayedSkin = car.value("skin").toString();
                 break;
             }
         }
@@ -1384,7 +1400,7 @@ private:
                                item.value("name").toString(), item.value("id").toString());
             }
         }
-        skin_->setCurrentIndex(qMax(0, skin_->findData(selectedSkin_)));
+        skin_->setCurrentIndex(qMax(0, skin_->findData(displayedSkin)));
     }
 
     void updateCarVariants()
@@ -1407,8 +1423,7 @@ private:
         }
         bool matches = carVariant_->count() == variants.size();
         for (int index = 0; matches && index < variants.size(); ++index)
-            matches = carVariant_->itemData(index).toJsonObject().value("id").toString()
-                == variants.at(index).toObject().value("id").toString();
+            matches = carVariant_->itemData(index).toJsonObject() == variants.at(index).toObject();
         if (!matches) {
             const QSignalBlocker blocker(carVariant_);
             carVariant_->clear();
@@ -1499,6 +1514,7 @@ private:
     QLineEdit *onlineSearch_{}; QTableWidget *onlineTable_{}; QLabel *onlineDetails_{}; QComboBox *onlineCar_{}; QLineEdit *onlinePassword_{}; QPushButton *onlineJoin_{}; QLabel *onlineError_{};
     QLabel *showroomSelection_{}; QLabel *setupSummary_{}; QTableWidget *setupList_{}; QComboBox *setupTrack_{}; QLineEdit *setupName_{}; QPushButton *setupUse_{}; QPushButton *setupDelete_{}; QLabel *toolsError_{};
     QLineEdit *settingsSearch_{}; QTabBar *settingsKind_{}; QListWidget *moduleList_{}; QScrollArea *settingsScroll_{}; QLineEdit *presetName_{}; QComboBox *presetList_{};
+    QString externalSessionRevision_;
     QTimer poll_; QTimer racePoll_; QTimer applyTimer_; bool updating_ = false;
     bool cspReleaseRequested_ = false;
     QString selectedCar_, selectedSkin_, selectedTrack_, carsCache_, tracksCache_, replayCache_, conditionsCache_, weatherCache_, acCache_, cspCache_, controlsCache_, controlInputCache_, presetsCache_, appLayoutCache_, contentPreviewCache_, contentHistoryCache_, cspReleasesCache_, serversCache_, setupsCache_;
