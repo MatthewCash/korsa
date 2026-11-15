@@ -6,6 +6,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub const DASHBOARD_CAPACITY: usize = 6;
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Preferences {
     #[serde(default)]
@@ -163,8 +165,8 @@ fn toggle_limited<T: Ord>(items: &mut BTreeSet<T>, item: T) -> Result<bool> {
         return Ok(false);
     }
     anyhow::ensure!(
-        items.len() < 3,
-        "the dashboard supports at most three choices"
+        items.len() < DASHBOARD_CAPACITY,
+        "the dashboard supports at most six choices"
     );
     items.insert(item);
     Ok(true)
@@ -196,13 +198,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dashboard_choices_are_limited_to_three() {
+    fn dashboard_choices_are_limited_to_six() {
         let mut choices = BTreeSet::new();
         assert!(toggle_limited(&mut choices, "one").unwrap());
         assert!(toggle_limited(&mut choices, "two").unwrap());
         assert!(toggle_limited(&mut choices, "three").unwrap());
-        assert!(toggle_limited(&mut choices, "four").is_err());
-        assert!(!toggle_limited(&mut choices, "two").unwrap());
         assert!(toggle_limited(&mut choices, "four").unwrap());
+        assert!(toggle_limited(&mut choices, "five").unwrap());
+        assert!(toggle_limited(&mut choices, "six").unwrap());
+        assert!(toggle_limited(&mut choices, "seven").is_err());
+        assert!(!toggle_limited(&mut choices, "two").unwrap());
+        assert!(toggle_limited(&mut choices, "seven").unwrap());
     }
 }
