@@ -3,6 +3,7 @@ mod app_layout;
 mod backend;
 mod configuration;
 mod content;
+mod controller_launch;
 mod controls;
 mod csp;
 mod csp_versions;

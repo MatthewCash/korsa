@@ -1,8 +1,8 @@
 use crate::{configuration, discovery::Installation, preferences, session};
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::{ErrorKind, Read},
     os::unix::fs::OpenOptionsExt,
@@ -23,6 +23,226 @@ const AXIS_SECTIONS: [(&str, &str); 5] = [
     ("CLUTCH", "Clutch"),
     ("HANDBRAKE", "Handbrake"),
 ];
+
+// This local uinput proxy has no hardware serial. Wine's HID path can change
+// when it is recreated, so its unique product/name pair is its stable identity.
+const VIRTUAL_SHIFTER_NAME: &str = "SIMSONN HS PRO AC Shifter";
+const VIRTUAL_SHIFTER_PRODUCT: &str = "6014DDFD-0000-0000-0000-504944564944";
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct DirectInputController {
+    name: String,
+    instance_guid: String,
+    product_guid: String,
+    path: String,
+}
+
+pub(crate) fn needs_controller_refresh(installation: &Installation) -> Result<bool> {
+    let contents = fs::read_to_string(controls_path(installation))
+        .context("could not read controls.ini before validating controllers")?;
+    let sections = parse_sections(&contents);
+    Ok(
+        value(&sections, "HEADER", "INPUT_METHOD", "KEYBOARD").eq_ignore_ascii_case("WHEEL")
+            && !required_controllers(&sections).is_empty(),
+    )
+}
+
+fn required_controllers(sections: &[IniSection]) -> BTreeSet<i32> {
+    let mut required = BTreeSet::new();
+    for section in sections {
+        let active = if section.name.eq_ignore_ascii_case("SHIFTER") {
+            section.values.get("ACTIVE").is_some_and(|v| v == "1")
+                && section.values.iter().any(|(key, v)| {
+                    key.starts_with("GEAR_") && v.parse::<i32>().is_ok_and(|v| v >= 0)
+                })
+        } else {
+            ["AXLE", "BUTTON"].iter().any(|key| {
+                section
+                    .values
+                    .get(*key)
+                    .is_some_and(|v| v.parse::<i32>().is_ok_and(|v| v >= 0))
+            })
+        };
+        if !active {
+            continue;
+        }
+        for key in ["JOY", "JOY_MODIFICATOR"] {
+            if key == "JOY_MODIFICATOR"
+                && !section
+                    .values
+                    .get("BUTTON_MODIFICATOR")
+                    .is_some_and(|v| v.parse::<i32>().is_ok_and(|v| v >= 0))
+            {
+                continue;
+            }
+            if let Some(index) = section
+                .values
+                .get(key)
+                .and_then(|v| v.parse::<i32>().ok())
+                .filter(|index| *index >= 0)
+            {
+                required.insert(index);
+            }
+        }
+    }
+    required
+}
+
+fn normalized_guid(guid: &str) -> Result<String> {
+    let guid = guid.trim().trim_start_matches('{').trim_end_matches('}');
+    anyhow::ensure!(
+        guid.len() == 36
+            && guid.bytes().enumerate().all(|(i, byte)| {
+                if [8, 13, 18, 23].contains(&i) {
+                    byte == b'-'
+                } else {
+                    byte.is_ascii_hexdigit()
+                }
+            }),
+        "invalid controller GUID: {guid}"
+    );
+    Ok(guid.to_ascii_uppercase())
+}
+
+/// Resolve by hardware identity, never by a potentially recycled instance GUID.
+/// The known serial-less virtual shifter can be rebound by unique product/name.
+/// Compute the entire update before writing, so a missing device changes nothing.
+fn refreshed_controller_ids(contents: &str, attached: &[DirectInputController]) -> Result<String> {
+    let sections = parse_sections(contents);
+    let controllers = controllers(&sections);
+    let mut updated = contents.to_owned();
+    let mut used = BTreeSet::new();
+    for index in required_controllers(&sections) {
+        let controller = controllers
+            .iter()
+            .find(|c| c.index == index)
+            .with_context(|| {
+                format!("controller {index} is used by a binding but absent from [CONTROLLERS]")
+            })?;
+        let product = if controller.guid.is_empty() {
+            None
+        } else {
+            Some(normalized_guid(&controller.guid)?)
+        };
+        let saved_path = value(
+            &sections,
+            "CONTROLLERS",
+            &format!("__KORSA_PATH{index}"),
+            "",
+        );
+        let candidates = attached
+            .iter()
+            .filter(|device| {
+                if let Some(product) = &product {
+                    normalized_guid(&device.product_guid).is_ok_and(|p| &p == product)
+                } else {
+                    let name = normalize_name(&controller.name);
+                    (!name.is_empty() && normalize_name(&device.name) == name)
+                        || device
+                            .name
+                            .trim()
+                            .eq_ignore_ascii_case(controller.name.trim())
+                }
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            !candidates.is_empty(),
+            "required controller '{}' is missing. Connect it before launching Assetto Corsa",
+            controller.name
+        );
+        let device = if !saved_path.is_empty() {
+            let exact = candidates
+                .iter()
+                .filter(|d| d.path.eq_ignore_ascii_case(&saved_path))
+                .collect::<Vec<_>>();
+            if exact.is_empty()
+                && product.as_deref() == Some(VIRTUAL_SHIFTER_PRODUCT)
+                && controller.name.eq_ignore_ascii_case(VIRTUAL_SHIFTER_NAME)
+            {
+                anyhow::ensure!(
+                    candidates.len() == 1,
+                    "virtual controller '{}' is ambiguous: {} attached devices share its product identity",
+                    controller.name,
+                    candidates.len()
+                );
+                let device = candidates[0];
+                anyhow::ensure!(
+                    device.name.eq_ignore_ascii_case(VIRTUAL_SHIFTER_NAME),
+                    "required virtual controller '{}' has an unexpected name; Assetto Corsa was not started",
+                    controller.name
+                );
+                log::info!(
+                    "re-identifying virtual controller '{}' after its Wine hardware path changed",
+                    controller.name
+                );
+                device
+            } else {
+                anyhow::ensure!(
+                    !exact.is_empty(),
+                    "required controller '{}' no longer has its saved hardware path. Reconnect the original device, or remove __KORSA_PATH{index} from controls.ini to identify a replacement",
+                    controller.name
+                );
+                anyhow::ensure!(
+                    exact.len() == 1,
+                    "controller '{}' has an ambiguous hardware path",
+                    controller.name
+                );
+                *exact[0]
+            }
+        } else {
+            anyhow::ensure!(
+                candidates.len() == 1,
+                "controller '{}' is ambiguous: {} attached devices share its identity. Disconnect duplicates and launch once to identify it",
+                controller.name,
+                candidates.len()
+            );
+            candidates[0]
+        };
+        let instance = normalized_guid(&device.instance_guid)?;
+        anyhow::ensure!(
+            used.insert(instance.clone()),
+            "multiple configured controllers resolve to '{}'; check the controller bindings",
+            device.name
+        );
+        for (key, new_value) in [
+            (format!("__IGUID{index}"), instance),
+            (
+                format!("PGUID{index}"),
+                normalized_guid(&device.product_guid)?,
+            ),
+            (format!("__KORSA_PATH{index}"), device.path.clone()),
+        ] {
+            // HID paths are opaque, but must not be able to introduce INI keys/comments.
+            anyhow::ensure!(
+                !new_value.contains(['\r', '\n', ';']),
+                "invalid controller identity"
+            );
+            if value(&sections, "CONTROLLERS", &key, "") != new_value {
+                updated = configuration::set_ini_value(&updated, "CONTROLLERS", &key, &new_value);
+            }
+        }
+    }
+    Ok(updated)
+}
+
+pub(crate) fn refresh_controller_ids(installation: &Installation, manifest: &str) -> Result<()> {
+    let attached: Vec<DirectInputController> = serde_json::from_str(manifest)
+        .context("the Wine controller helper returned an invalid device manifest")?;
+    let path = controls_path(installation);
+    let contents = fs::read_to_string(&path).context("could not read controls.ini")?;
+    let updated = refreshed_controller_ids(&contents, &attached)?;
+    if updated != contents {
+        let backup = path.with_file_name("controls.ini.before-korsa-controller-refresh");
+        preferences::atomic_write(&backup, &contents)
+            .context("could not back up controller bindings")?;
+        preferences::atomic_write(&path, &updated).context("could not refresh controller IDs")?;
+        log::info!(
+            "refreshed DirectInput controller IDs; previous controls saved to {}",
+            backup.display()
+        );
+    }
+    Ok(())
+}
 
 #[derive(Debug, Serialize)]
 struct ControlsModel {
@@ -945,6 +1165,293 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const SAMPLE: &str = "[HEADER]\nINPUT_METHOD=WHEEL\n\n[CONTROLLERS]\nCON0=Test Wheel\nPGUID0=123\n\n[STEER]\nJOY=0\nAXLE=1\nMIN=-1\nMAX=1\n\n[GEARUP]\nJOY=0\nBUTTON=3\nKEY=0x20\n";
+
+    const WHEEL_PRODUCT: &str = "0002346E-0000-0000-0000-504944564944";
+    const PEDAL_PRODUCT: &str = "0003346E-0000-0000-0000-504944564944";
+    const SHIFTER_PRODUCT: &str = "6014DDFD-0000-0000-0000-504944564944";
+
+    fn instance(suffix: &str) -> String {
+        format!("9E573E{suffix}-7734-11D2-8D4A-23903FB6BDF7")
+    }
+
+    fn attached_controller(name: &str, product: &str, suffix: &str) -> DirectInputController {
+        DirectInputController {
+            name: name.into(),
+            product_guid: format!("{{{product}}}"),
+            instance_guid: format!("{{{}}}", instance(suffix).to_ascii_lowercase()),
+            path: format!(r"\\?\HID#{name}#serial"),
+        }
+    }
+
+    fn attached_controllers() -> Vec<DirectInputController> {
+        vec![
+            attached_controller("Wheel", WHEEL_PRODUCT, "DD"),
+            attached_controller("Pedals", PEDAL_PRODUCT, "DE"),
+            attached_controller("Shifter", SHIFTER_PRODUCT, "DF"),
+        ]
+    }
+
+    fn stale_controls() -> String {
+        format!(
+            "[HEADER]\r\nINPUT_METHOD=WHEEL\r\n[CONTROLLERS]\r\n\
+            CON0=Wheel\r\nPGUID0={WHEEL_PRODUCT}\r\n__IGUID0={}\r\n\
+            CON1=Pedals\r\nPGUID1={PEDAL_PRODUCT}\r\n__IGUID1={}\r\n\
+            CON2=Shifter\r\nPGUID2={SHIFTER_PRODUCT}\r\n__IGUID2={}\r\n\
+            CON3=Unused unplugged controller\r\n\
+            [STEER]\r\nJOY=0\r\nAXLE=0\r\nFF_GAIN=0.6\r\n\
+            [THROTTLE]\r\nJOY=1\r\nAXLE=0\r\nMIN=-0.98\r\nMAX=1\r\n\
+            [BRAKES]\r\nJOY=1\r\nAXLE=1\r\nGAMMA=1\r\n\
+            [SHIFTER]\r\nACTIVE=1\r\nJOY=2\r\nGEAR_1=0\r\nGEAR_R=7\r\n\
+            [GEARUP]\r\nJOY=0\r\nBUTTON=13\r\nKEY=0x20 ; Space\r\n\
+            [UNBOUND]\r\nJOY=3\r\nBUTTON=-1\r\n",
+            instance("DE"),
+            instance("DF"),
+            instance("DD")
+        )
+    }
+
+    #[test]
+    fn repairs_recycled_instance_ids_without_changing_bindings() {
+        let original = stale_controls();
+        let updated = refreshed_controller_ids(&original, &attached_controllers()).unwrap();
+        let sections = parse_sections(&updated);
+        for (i, suffix) in ["DD", "DE", "DF"].iter().enumerate() {
+            assert_eq!(
+                value(&sections, "CONTROLLERS", &format!("__IGUID{i}"), ""),
+                instance(suffix)
+            );
+        }
+        // Every byte outside the controller table is untouched, including CRLF/comments.
+        assert_eq!(
+            original.split_once("[STEER]").unwrap().1,
+            updated.split_once("[STEER]").unwrap().1
+        );
+        assert!(updated.contains("\r\n"));
+        assert_eq!(
+            refreshed_controller_ids(&updated, &attached_controllers()).unwrap(),
+            updated
+        );
+    }
+
+    #[test]
+    fn missing_required_device_fails_instead_of_following_its_old_guid() {
+        let devices = attached_controllers()
+            .into_iter()
+            .filter(|d| d.name != "Wheel")
+            .collect::<Vec<_>>();
+        let error = refreshed_controller_ids(&stale_controls(), &devices).unwrap_err();
+        assert!(error.to_string().contains("'Wheel' is missing"));
+    }
+
+    #[test]
+    fn duplicate_products_require_a_known_hardware_path() {
+        let mut devices = attached_controllers();
+        let known = refreshed_controller_ids(&stale_controls(), &devices).unwrap();
+        let mut duplicate = attached_controller("Wheel", WHEEL_PRODUCT, "D9");
+        duplicate.path.push_str("-other-serial");
+        devices.push(duplicate);
+        assert!(
+            refreshed_controller_ids(&stale_controls(), &devices)
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+        assert_eq!(refreshed_controller_ids(&known, &devices).unwrap(), known);
+        devices.remove(0);
+        assert!(
+            refreshed_controller_ids(&known, &devices)
+                .unwrap_err()
+                .to_string()
+                .contains("saved hardware path")
+        );
+    }
+
+    #[test]
+    fn reidentifies_the_unique_virtual_shifter_after_path_and_instance_changes() {
+        let original =
+            stale_controls().replace("CON2=Shifter", &format!("CON2={VIRTUAL_SHIFTER_NAME}"));
+        let mut devices = attached_controllers();
+        devices[2].name = VIRTUAL_SHIFTER_NAME.into();
+        let known = refreshed_controller_ids(&original, &devices).unwrap();
+        // Recreating uinput can change both Wine's path and its instance GUID.
+        devices[2].path.push_str("-recreated");
+        devices[2].instance_guid = instance("D8");
+        let updated = refreshed_controller_ids(&known, &devices).unwrap();
+        let sections = parse_sections(&updated);
+        assert_eq!(
+            value(&sections, "CONTROLLERS", "__KORSA_PATH2", ""),
+            devices[2].path
+        );
+        assert_eq!(
+            value(&sections, "CONTROLLERS", "__IGUID2", ""),
+            instance("D8")
+        );
+        assert_eq!(
+            known.split_once("[STEER]").unwrap().1,
+            updated.split_once("[STEER]").unwrap().1
+        );
+        assert_eq!(
+            refreshed_controller_ids(&updated, &devices).unwrap(),
+            updated
+        );
+    }
+
+    #[test]
+    fn virtual_shifter_reidentification_rejects_duplicates_missing_and_wrong_devices() {
+        let original =
+            stale_controls().replace("CON2=Shifter", &format!("CON2={VIRTUAL_SHIFTER_NAME}"));
+        let mut devices = attached_controllers();
+        devices[2].name = VIRTUAL_SHIFTER_NAME.into();
+        let known = refreshed_controller_ids(&original, &devices).unwrap();
+        devices[2].path.push_str("-recreated");
+        let mut duplicate = attached_controller(VIRTUAL_SHIFTER_NAME, SHIFTER_PRODUCT, "D8");
+        duplicate.path.push_str("-duplicate");
+        devices.push(duplicate);
+        assert!(
+            refreshed_controller_ids(&known, &devices)
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+        devices.pop();
+        devices[2].name = "Unexpected device".into();
+        assert!(
+            refreshed_controller_ids(&known, &devices)
+                .unwrap_err()
+                .to_string()
+                .contains("unexpected name")
+        );
+        devices[2].name = VIRTUAL_SHIFTER_NAME.into();
+        devices[2].product_guid = PEDAL_PRODUCT.into();
+        assert!(refreshed_controller_ids(&known, &devices).is_err());
+        devices.pop();
+        assert!(
+            refreshed_controller_ids(&known, &devices)
+                .unwrap_err()
+                .to_string()
+                .contains("is missing")
+        );
+    }
+
+    #[test]
+    fn physical_controllers_still_require_their_saved_path_even_when_unique() {
+        let mut devices = attached_controllers();
+        let known = refreshed_controller_ids(&stale_controls(), &devices).unwrap();
+        devices[0].path.push_str("-replacement");
+        assert!(
+            refreshed_controller_ids(&known, &devices)
+                .unwrap_err()
+                .to_string()
+                .contains("saved hardware path")
+        );
+    }
+
+    #[test]
+    fn products_take_precedence_over_names_and_unknown_products_do_not_fall_back() {
+        let mut devices = attached_controllers();
+        devices[0].name = "Different driver display name".into();
+        assert!(refreshed_controller_ids(&stale_controls(), &devices).is_ok());
+        devices[0].name = "Wheel".into();
+        devices[0].product_guid = PEDAL_PRODUCT.into();
+        assert!(refreshed_controller_ids(&stale_controls(), &devices).is_err());
+        let original = stale_controls().replace(&format!("PGUID0={WHEEL_PRODUCT}\r\n"), "");
+        devices[0].product_guid = WHEEL_PRODUCT.into();
+        assert!(refreshed_controller_ids(&original, &devices).is_ok());
+    }
+
+    #[test]
+    fn does_not_require_disabled_shifters_or_unbound_modifiers() {
+        let original = "[SHIFTER]\nACTIVE=0\nJOY=2\nGEAR_1=0\n\
+            [GEARUP]\nJOY=0\nBUTTON=13\nJOY_MODIFICATOR=3\nBUTTON_MODIFICATOR=-1\n\
+            [UNBOUND]\nJOY=4\nAXLE=-1\nBUTTON=-1\n";
+        assert_eq!(
+            required_controllers(&parse_sections(original)),
+            BTreeSet::from([0])
+        );
+        let original = original.replace("BUTTON_MODIFICATOR=-1", "BUTTON_MODIFICATOR=0");
+        assert_eq!(
+            required_controllers(&parse_sections(&original)),
+            BTreeSet::from([0, 3])
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_manifests_and_double_assignment() {
+        let original = stale_controls();
+        let mut devices = attached_controllers();
+        devices[0].instance_guid = "invalid".into();
+        assert!(refreshed_controller_ids(&original, &devices).is_err());
+        devices = attached_controllers();
+        devices[1].instance_guid = devices[0].instance_guid.clone();
+        assert!(
+            refreshed_controller_ids(&original, &devices)
+                .unwrap_err()
+                .to_string()
+                .contains("multiple configured")
+        );
+        assert!(
+            refreshed_controller_ids(
+                &original.replace("CON0=Wheel", "IGNORED=Wheel"),
+                &attached_controllers()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn controller_refresh_backs_up_only_successful_changes() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("korsa-controller-refresh-{unique}"));
+        fs::create_dir_all(root.join("cfg")).unwrap();
+        let installation = Installation {
+            steam_root: root.clone(),
+            library_root: root.clone(),
+            game_root: root.clone(),
+            proton_prefix: root.clone(),
+            documents_root: root.clone(),
+            proton_command: root.clone(),
+            proton_config: None,
+            runtime_root: root.clone(),
+            runtime_client: root.clone(),
+        };
+        let path = controls_path(&installation);
+        let backup = root.join("cfg/controls.ini.before-korsa-controller-refresh");
+        let original = stale_controls();
+        fs::write(&path, &original).unwrap();
+        assert!(needs_controller_refresh(&installation).unwrap());
+        for invalid in ["[]", "invalid JSON"] {
+            assert!(refresh_controller_ids(&installation, invalid).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert!(!backup.exists());
+        }
+        // Serialize the same manifest format emitted by the native helper.
+        let manifest = serde_json::Value::Array(
+            attached_controllers()
+                .iter()
+                .map(|d| {
+                    serde_json::json!({
+                        "name": d.name, "instance_guid": d.instance_guid,
+                        "product_guid": d.product_guid, "path": d.path,
+                    })
+                })
+                .collect(),
+        )
+        .to_string();
+        refresh_controller_ids(&installation, &manifest).unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+        refresh_controller_ids(&installation, &manifest).unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+        fs::write(
+            &path,
+            original.replace("INPUT_METHOD=WHEEL", "INPUT_METHOD=KEYBOARD"),
+        )
+        .unwrap();
+        assert!(!needs_controller_refresh(&installation).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn parses_devices_axes_and_buttons() {

@@ -1,4 +1,6 @@
-use crate::{configuration, discovery::Installation, preferences};
+use crate::{
+    configuration, controller_launch::ControllerLaunch, discovery::Installation, preferences,
+};
 use anyhow::{Context, Result, bail, ensure};
 use std::{ffi::OsString, fs, path::PathBuf, process::Stdio, time::Duration};
 use tokio::{process::Command, time::sleep};
@@ -47,7 +49,8 @@ pub async fn launch_existing_session(installation: &Installation) -> Result<u32>
         .parent()
         .context("invalid Proton prefix path")?
         .to_path_buf();
-    ensure_steam_service(installation).await?;
+    let steam_service = ensure_steam_service(installation).await?;
+    let controller_launch = ControllerLaunch::prepare(installation)?;
 
     log::info!(
         "launching the existing race through Steam Linux Runtime with {}",
@@ -59,9 +62,16 @@ pub async fn launch_existing_session(installation: &Installation) -> Result<u32>
     let mut command = Command::new(&installation.runtime_client);
     command.args(launch_arguments(
         installation,
+        &steam_service,
         &compatibility_data,
-        "acs.exe",
+        controller_launch
+            .as_ref()
+            .map_or_else(|| PathBuf::from("acs.exe"), ControllerLaunch::executable)
+            .as_path(),
     ));
+    if let Some(launch) = &controller_launch {
+        command.args(launch.arguments(installation)?);
+    }
     command
         .current_dir(&installation.game_root)
         .stdin(Stdio::null())
@@ -76,9 +86,18 @@ pub async fn launch_existing_session(installation: &Installation) -> Result<u32>
         .id()
         .context("Steam runtime launcher started without a process ID")?;
 
+    if let Some(launch) = &controller_launch {
+        launch
+            .validate_and_approve(installation, &mut child)
+            .await?;
+    }
+
     let deadline = tokio::time::Instant::now() + START_TIMEOUT;
     let mut running_since = None;
     loop {
+        if let Some(launch) = &controller_launch {
+            launch.check_error()?;
+        }
         if process_is_running()? {
             let since = running_since.get_or_insert_with(tokio::time::Instant::now);
             if since.elapsed() >= STABILITY_WINDOW {
@@ -165,9 +184,9 @@ fn showroom_configuration(original: &str, car: &str, skin: &str) -> String {
     contents
 }
 
-pub(crate) async fn ensure_steam_service(installation: &Installation) -> Result<()> {
-    if steam_service_available(installation).await? {
-        return Ok(());
+pub(crate) async fn ensure_steam_service(installation: &Installation) -> Result<String> {
+    if let Some(service) = steam_service_name(installation).await? {
+        return Ok(service);
     }
 
     log::info!("starting Steam for the runtime launcher service");
@@ -182,8 +201,8 @@ pub(crate) async fn ensure_steam_service(installation: &Installation) -> Result<
 
     let deadline = tokio::time::Instant::now() + START_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
-        if steam_service_available(installation).await? {
-            return Ok(());
+        if let Some(service) = steam_service_name(installation).await? {
+            return Ok(service);
         }
         sleep(POLL_INTERVAL).await;
     }
@@ -191,23 +210,38 @@ pub(crate) async fn ensure_steam_service(installation: &Installation) -> Result<
     bail!("Steam runtime launcher service did not become available")
 }
 
-async fn steam_service_available(installation: &Installation) -> Result<bool> {
+async fn steam_service_name(installation: &Installation) -> Result<Option<String>> {
     let output = Command::new(&installation.runtime_client)
         .arg("--list")
         .output()
         .await
         .context("failed to inspect Steam runtime launcher services")?;
 
-    Ok(output.status.success()
-        && String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line == format!("--bus-name={LAUNCH_SERVICE}")))
+    ensure!(
+        output.status.success(),
+        "failed to list Steam runtime launcher services: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(parse_steam_service_name(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn parse_steam_service_name(output: &str) -> Option<String> {
+    output
+        .lines()
+        .filter_map(|line| line.strip_prefix("--bus-name="))
+        .find(|name| {
+            *name == LAUNCH_SERVICE || name.starts_with(&format!("{LAUNCH_SERVICE}.Instance"))
+        })
+        .map(str::to_owned)
 }
 
 fn launch_arguments(
     installation: &Installation,
+    steam_service: &str,
     compatibility_data: &std::path::Path,
-    executable_name: &str,
+    executable_name: &std::path::Path,
 ) -> Vec<OsString> {
     let runtime_entry = installation.runtime_root.join("_v2-entry-point");
     let executable = installation.game_root.join(executable_name);
@@ -223,7 +257,7 @@ fn launch_arguments(
         .join("steamapps/common/Steamworks Shared");
 
     let mut arguments: Vec<OsString> = [
-        "--alongside-steam".into(),
+        format!("--bus-name={steam_service}").into(),
         format!("--directory={}", installation.game_root.display()).into(),
         format!("--env=SteamAppId={APP_ID}").into(),
         format!("--env=SteamGameId={APP_ID}").into(),
@@ -451,8 +485,12 @@ mod tests {
 
     #[test]
     fn launches_acs_through_runtime_alongside_steam() {
-        let arguments =
-            launch_arguments(&installation(), Path::new("/compatdata/244210"), "acs.exe");
+        let arguments = launch_arguments(
+            &installation(),
+            "com.steampowered.PressureVessel.LaunchAlongsideSteam.Instance10013",
+            Path::new("/compatdata/244210"),
+            Path::new("acs.exe"),
+        );
         let arguments = arguments
             .iter()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -460,7 +498,7 @@ mod tests {
 
         assert_eq!(
             arguments.first().map(String::as_str),
-            Some("--alongside-steam")
+            Some("--bus-name=com.steampowered.PressureVessel.LaunchAlongsideSteam.Instance10013")
         );
         assert!(arguments.contains(&"--env=STEAM_COMPAT_APP_ID=244210".to_owned()));
         assert!(arguments.contains(&"--env=STEAM_COMPAT_CONFIG=noxalia".to_owned()));
@@ -481,6 +519,45 @@ mod tests {
         assert!(is_race_command(b"Z:\\home\\user\\assettocorsa\\acs.exe\0"));
         assert!(is_race_command(b"/games/assettocorsa/ACS.EXE\0"));
         assert!(!is_race_command(b"/games/assettocorsa/AssettoCorsa.exe\0"));
+    }
+
+    #[test]
+    fn helper_uses_the_same_proton_prefix_runtime_and_configuration_as_ac() {
+        let installation = installation();
+        let compatibility_data = Path::new("/compatdata/244210");
+        let helper = Path::new("/compatdata/244210/pfx/drive_c/korsa-launch/1/helper.exe");
+        let direct = launch_arguments(
+            &installation,
+            LAUNCH_SERVICE,
+            compatibility_data,
+            Path::new("acs.exe"),
+        );
+        let guarded = launch_arguments(&installation, LAUNCH_SERVICE, compatibility_data, helper);
+        assert_eq!(direct[..direct.len() - 1], guarded[..guarded.len() - 1]);
+        assert_eq!(guarded.last().unwrap(), helper.as_os_str());
+    }
+
+    #[test]
+    fn discovers_legacy_and_instance_specific_steam_services() {
+        assert_eq!(
+            parse_steam_service_name(&format!("--bus-name={LAUNCH_SERVICE}\n")),
+            Some(LAUNCH_SERVICE.into())
+        );
+        let instance = format!("{LAUNCH_SERVICE}.Instance10013");
+        assert_eq!(
+            parse_steam_service_name(&format!(
+                "--bus-name=org.freedesktop.Flatpak\n--bus-name={instance}\n"
+            )),
+            Some(instance)
+        );
+        assert_eq!(
+            parse_steam_service_name("--bus-name=org.freedesktop.Flatpak\n"),
+            None
+        );
+        assert_eq!(
+            parse_steam_service_name(&format!("--bus-name={LAUNCH_SERVICE}Other")),
+            None
+        );
     }
 
     #[test]

@@ -41,6 +41,7 @@
             nativeBuildInputs = with pkgs; [
               clang
               pkg-config
+              pkgsCross.mingwW64.stdenv.cc
               kdePackages.wrapQtAppsHook
             ];
             buildInputs = with pkgs; [
@@ -50,6 +51,7 @@
             ];
 
             QMAKE = qmake;
+            KORSA_MINGW_CC = "${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-gcc";
             KORSA_KWINDOWSYSTEM_INCLUDE_DIR = "${pkgs.kdePackages.kwindowsystem.dev}/include/KF6";
             KORSA_KWINDOWSYSTEM_LIBRARY_DIR = "${pkgs.kdePackages.kwindowsystem}/lib";
 
@@ -97,8 +99,10 @@
               pkg-config
               rustc
               rustfmt
+              pkgsCross.mingwW64.stdenv.cc
             ];
 
+            KORSA_MINGW_CC = "${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-gcc";
             RUSTFLAGS = "-C link-arg=-fuse-ld=lld -C link-arg=-Wl,-rpath,${pkgs.lib.makeLibraryPath [ qt pkgs.kdePackages.kwindowsystem pkgs.stdenv.cc.cc.lib ]}";
             KORSA_KWINDOWSYSTEM_INCLUDE_DIR = "${pkgs.kdePackages.kwindowsystem.dev}/include/KF6";
             KORSA_KWINDOWSYSTEM_LIBRARY_DIR = "${pkgs.kdePackages.kwindowsystem}/lib";
