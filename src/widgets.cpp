@@ -325,9 +325,9 @@ private:
         busy_->setRange(0, 0);
         busy_->setMaximumWidth(100);
         busy_->hide();
+        statusBar()->addWidget(busy_);
         statusBar()->addWidget(statusLabel_, 1);
         statusBar()->addPermanentWidget(cspLabel_);
-        statusBar()->addPermanentWidget(busy_);
     }
 
     void buildDrive()
@@ -1080,18 +1080,18 @@ private:
         const bool launching = boolProperty(backend_, "launching");
         const bool raceRunning = boolProperty(backend_, "race_running");
         if (driveButton_) {
-            driveButton_->setEnabled(!launching);
+            driveButton_->setEnabled(!launching && !boolProperty(backend_, "session_busy") && !contentBusy);
             driveButton_->setText(raceRunning ? tr("Stop") : tr("Drive"));
             driveButton_->setIcon(QIcon::fromTheme(raceRunning ? "media-playback-stop" : "media-playback-start"));
         }
         if (driveAction_) {
-            driveAction_->setEnabled(!launching);
+            driveAction_->setEnabled(!launching && !boolProperty(backend_, "session_busy") && !contentBusy);
             driveAction_->setText(raceRunning ? tr("Stop") : tr("Drive"));
             driveAction_->setIcon(QIcon::fromTheme(raceRunning ? "media-playback-stop" : "media-playback-start"));
         }
         if (onlineJoin_)
             onlineJoin_->setEnabled(!launching && onlineTable_->currentRow() >= 0 && onlineCar_->count() > 0);
-        statusLabel_->setText(textProperty(backend_, "status")); cspLabel_->setText(textProperty(backend_, "csp_status")); busy_->setVisible(boolProperty(backend_, "scanning") || boolProperty(backend_, "launching") || contentBusy || onlineBusy);
+        statusLabel_->setText(textProperty(backend_, "status")); cspLabel_->setText(textProperty(backend_, "csp_status")); busy_->setVisible(boolProperty(backend_, "scanning") || boolProperty(backend_, "launching") || boolProperty(backend_, "session_busy") || boolProperty(backend_, "setups_busy") || !pendingImages.isEmpty() || contentBusy || onlineBusy);
         if (imageRevisionSeen_ != imageRevision) {
             imageRevisionSeen_ = imageRevision;
             for (auto *list : {carList_, trackList_}) {

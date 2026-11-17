@@ -18,6 +18,8 @@ pub mod ffi {
         #[qproperty(bool, control_monitoring)]
         #[qproperty(bool, content_busy)]
         #[qproperty(bool, online_busy)]
+        #[qproperty(bool, session_busy)]
+        #[qproperty(bool, setups_busy)]
         #[qproperty(QString, status)]
         #[qproperty(QString, error_message)]
         #[qproperty(QString, control_capture_target)]
@@ -276,6 +278,10 @@ use std::{
 };
 
 pub struct BackendRust {
+    session_busy: bool,
+    setups_busy: bool,
+    setups_revision: u64,
+    pending_configuration: Option<(String, String, String, String)>,
     session_revision_seen: u64,
     external_session_revision: QString,
     scanning: bool,
@@ -350,6 +356,10 @@ pub struct BackendRust {
 impl Default for BackendRust {
     fn default() -> Self {
         Self {
+            session_busy: false,
+            setups_busy: false,
+            setups_revision: 0,
+            pending_configuration: None,
             session_revision_seen: 0,
             external_session_revision: QString::default(),
             scanning: false,
@@ -1146,7 +1156,10 @@ impl ffi::Backend {
         }
         self.as_mut().rust_mut().get_mut().race_state_busy = true;
         let revision = crate::ipc::session_revision();
-        let installation = if revision != self.rust().session_revision_seen && !*self.scanning() {
+        let installation = if revision != self.rust().session_revision_seen
+            && !*self.scanning()
+            && !*self.session_busy()
+        {
             self.rust().installation.clone()
         } else {
             None
@@ -1169,14 +1182,19 @@ impl ffi::Backend {
                 match result {
                     Ok((running, selected)) => {
                         match running {
-                            Ok(running) => backend.as_mut().set_race_running(running),
+                            Ok(running) => {
+                                if !running && backend.status().to_string() == "Assetto Corsa is running" {
+                                    backend.as_mut().set_status(QString::from("Assetto Corsa has stopped"));
+                                }
+                                backend.as_mut().set_race_running(running);
+                            }
                             Err(error) => log::warn!(
                                 "could not inspect Assetto Corsa process state: {error:#}"
                             ),
                         }
                         // Discard a read overtaken by another UI write. The next
                         // tick retries the latest revision without resetting edits.
-                        if revision == crate::ipc::session_revision() && !*backend.scanning() {
+                        if revision == crate::ipc::session_revision() && !*backend.scanning() && !*backend.session_busy() {
                             match selected {
                                 Some(Ok((session, conditions))) => {
                                     log::debug!("synchronized dashboard selection revision {revision}: {} at {}",
@@ -1270,7 +1288,7 @@ impl ffi::Backend {
     }
 
     pub fn launch_existing_session(mut self: Pin<&mut Self>) {
-        if *self.launching() {
+        if *self.launching() || *self.session_busy() || *self.content_busy() || *self.scanning() {
             return;
         }
 
@@ -1340,7 +1358,7 @@ impl ffi::Backend {
         track_key: &QString,
         conditions_json: &QString,
     ) {
-        if *self.launching() {
+        if *self.launching() || *self.session_busy() || *self.content_busy() || *self.scanning() {
             return;
         }
         if self.rust().session_revision_seen != crate::ipc::session_revision() {
@@ -1544,33 +1562,32 @@ impl ffi::Backend {
     }
 
     pub fn apply_preset(mut self: Pin<&mut Self>, id: &QString) {
-        let result = {
-            let rust = self.rust();
-            let installation = rust
-                .installation
-                .as_ref()
-                .context("Assetto Corsa installation is unavailable");
-            installation.and_then(|installation| {
-                configuration::apply_preset(installation, &rust.preferences, &id.to_string())
-            })
-        };
-        match result {
-            Ok(configuration::AppliedSession {
-                conditions,
-                session,
-                revision,
-            }) => {
-                apply_session(self.as_mut(), &session);
-                self.as_mut().rust_mut().get_mut().session_revision_seen = revision;
-                refresh_setups(self.as_mut());
-                if let Ok(json) = configuration::conditions_json(&conditions) {
-                    self.as_mut().set_conditions_json(text(&json));
-                }
-                self.as_mut()
-                    .set_status(QString::from("Preset applied to race.ini"));
-                self.as_mut().set_error_message(QString::default());
+        let preset = self
+            .rust()
+            .preferences
+            .presets
+            .iter()
+            .find(|preset| preset.id == id.to_string())
+            .cloned();
+        if let Some(preset) = preset {
+            match configuration::conditions_json(&preset.conditions) {
+                Ok(conditions) => self.as_mut().apply_configuration(
+                    &text(&preset.car_id),
+                    &text(&preset.skin_id),
+                    &text(&configuration::track_key(
+                        &preset.track_id,
+                        &preset.track_layout,
+                    )),
+                    &text(&conditions),
+                ),
+                Err(error) => set_operation_error(self.as_mut(), "Could not apply preset", error),
             }
-            Err(error) => set_operation_error(self.as_mut(), "Could not apply preset", error),
+        } else {
+            set_operation_error(
+                self.as_mut(),
+                "Could not apply preset",
+                anyhow::anyhow!("preset no longer exists"),
+            );
         }
     }
 
@@ -1581,45 +1598,113 @@ impl ffi::Backend {
         track_key: &QString,
         conditions_json: &QString,
     ) {
+        if *self.session_busy() {
+            self.as_mut().rust_mut().get_mut().pending_configuration = Some((
+                car_id.to_string(),
+                skin_id.to_string(),
+                track_key.to_string(),
+                conditions_json.to_string(),
+            ));
+            return;
+        }
         // A debounced widget edit can still refer to the session shown before
         // a dashboard click. Refresh instead of writing that stale snapshot back.
         if self.rust().session_revision_seen != crate::ipc::session_revision() {
             self.as_mut().refresh_race_state();
             return;
         }
-        let result = {
-            let rust = self.rust();
-            rust.installation
-                .as_ref()
-                .context("Assetto Corsa installation is unavailable")
-                .and_then(|installation| {
-                    configuration::apply_configuration_json(
-                        installation,
-                        &car_id.to_string(),
-                        &skin_id.to_string(),
-                        &track_key.to_string(),
-                        &conditions_json.to_string(),
-                        rust.session_revision_seen,
-                    )
-                })
+        let Some(installation) = self.rust().installation.clone() else {
+            return;
         };
-        match result {
-            Ok(configuration::AppliedSession {
-                conditions,
-                session,
-                revision,
-            }) => {
-                apply_session(self.as_mut(), &session);
-                self.as_mut().rust_mut().get_mut().session_revision_seen = revision;
-                refresh_setups(self.as_mut());
-                if let Ok(json) = configuration::conditions_json(&conditions) {
-                    self.as_mut().set_conditions_json(text(&json));
+        let (car, skin, track, conditions) = (
+            car_id.to_string(),
+            skin_id.to_string(),
+            track_key.to_string(),
+            conditions_json.to_string(),
+        );
+        let expected = self.rust().session_revision_seen;
+        self.as_mut().set_session_busy(true);
+        let qt_thread = self.qt_thread();
+        if let Err(error) = runtime::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let applied = configuration::apply_configuration_json(
+                    &installation,
+                    &car,
+                    &skin,
+                    &track,
+                    &conditions,
+                    expected,
+                )?;
+                let setups = setups::load_json(&installation, &applied.session.car_id)
+                    .unwrap_or_else(|error| {
+                        log::warn!("session saved but setups could not be loaded: {error:#}");
+                        "[]".to_owned()
+                    });
+                Ok::<_, anyhow::Error>((applied, setups))
+            })
+            .await;
+            let _ = qt_thread.queue(move |mut backend| {
+                backend.as_mut().set_session_busy(false);
+                match result {
+                    Ok(Ok((applied, setups)))
+                        if applied.revision == crate::ipc::session_revision() =>
+                    {
+                        backend.as_mut().rust_mut().get_mut().session_revision_seen =
+                            applied.revision;
+                        // A newer queued selection must not be overwritten by this completion.
+                        if backend.rust().pending_configuration.is_none() {
+                            apply_session(backend.as_mut(), &applied.session);
+                            backend.as_mut().set_setups_json(text(&setups));
+                            let count = serde_json::from_str::<Vec<serde_json::Value>>(&setups)
+                                .ok()
+                                .and_then(|items| i32::try_from(items.len()).ok())
+                                .unwrap_or(0);
+                            backend.as_mut().set_setup_count(count);
+                            backend.as_mut().rust_mut().get_mut().setups_revision += 1;
+                            backend.as_mut().set_setups_busy(false);
+                            if let Ok(json) = configuration::conditions_json(&applied.conditions) {
+                                backend.as_mut().set_conditions_json(text(&json));
+                            }
+                        }
+                        backend
+                            .as_mut()
+                            .set_status(QString::from("Race setup applied to race.ini"));
+                        backend.as_mut().set_error_message(QString::default());
+                    }
+                    Ok(Ok(_)) => {
+                        backend.as_mut().rust_mut().get_mut().pending_configuration = None;
+                    }
+                    Ok(Err(error)) => {
+                        backend.as_mut().rust_mut().get_mut().pending_configuration = None;
+                        set_operation_error(backend.as_mut(), "Could not apply race setup", error);
+                    }
+                    Err(error) => {
+                        backend.as_mut().rust_mut().get_mut().pending_configuration = None;
+                        set_operation_error(
+                            backend.as_mut(),
+                            "Session worker failed",
+                            error.into(),
+                        );
+                    }
                 }
-                self.as_mut()
-                    .set_status(QString::from("Race setup applied to race.ini"));
-                self.as_mut().set_error_message(QString::default());
-            }
-            Err(error) => set_operation_error(self.as_mut(), "Could not apply race setup", error),
+                let pending = backend
+                    .as_mut()
+                    .rust_mut()
+                    .get_mut()
+                    .pending_configuration
+                    .take();
+                if let Some((car, skin, track, conditions)) = pending {
+                    backend.as_mut().apply_configuration(
+                        &text(&car),
+                        &text(&skin),
+                        &text(&track),
+                        &text(&conditions),
+                    );
+                }
+            });
+        }) {
+            self.as_mut().set_session_busy(false);
+            set_operation_error(self.as_mut(), "Could not start session worker", error);
         }
     }
 
@@ -2212,17 +2297,43 @@ fn refresh_presets(mut backend: Pin<&mut ffi::Backend>) {
 }
 
 fn refresh_setups(mut backend: Pin<&mut ffi::Backend>) {
-    let result = backend.rust().installation.as_ref().map(|installation| {
-        setups::load_json(installation, &backend.car_id().to_string())
-            .unwrap_or_else(|_| "[]".to_owned())
-    });
-    if let Some(json) = result {
-        let count = serde_json::from_str::<Vec<serde_json::Value>>(&json)
-            .ok()
-            .and_then(|items| i32::try_from(items.len()).ok())
-            .unwrap_or(0);
-        backend.as_mut().set_setups_json(text(&json));
-        backend.as_mut().set_setup_count(count);
+    let Some(installation) = backend.rust().installation.clone() else {
+        return;
+    };
+    let car = backend.car_id().to_string();
+    backend.as_mut().rust_mut().get_mut().setups_revision += 1;
+    let revision = backend.rust().setups_revision;
+    backend.as_mut().set_setups_busy(true);
+    let qt_thread = backend.qt_thread();
+    if let Err(error) = runtime::spawn(async move {
+        let worker_car = car.clone();
+        let result =
+            tokio::task::spawn_blocking(move || setups::load_json(&installation, &worker_car))
+                .await;
+        let _ = qt_thread.queue(move |mut backend| {
+            if backend.rust().setups_revision != revision {
+                return;
+            }
+            backend.as_mut().set_setups_busy(false);
+            if backend.car_id().to_string() != car {
+                return;
+            }
+            match result {
+                Ok(Ok(json)) => {
+                    let count = serde_json::from_str::<Vec<serde_json::Value>>(&json)
+                        .ok()
+                        .and_then(|items| i32::try_from(items.len()).ok())
+                        .unwrap_or(0);
+                    backend.as_mut().set_setups_json(text(&json));
+                    backend.as_mut().set_setup_count(count);
+                }
+                Ok(Err(error)) => log::warn!("could not load setups: {error:#}"),
+                Err(error) => log::warn!("setup worker failed: {error}"),
+            }
+        });
+    }) {
+        backend.as_mut().set_setups_busy(false);
+        log::warn!("could not start setup worker: {error}");
     }
 }
 

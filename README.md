@@ -86,6 +86,11 @@ The outgoing car's existing livery is remembered on the first switch too. If a
 remembered skin was removed, Korsa uses an installed fallback instead. Dashboard
 thumbnails show each car's current/remembered livery, with its name in the tooltip.
 
+Session selections, preset application, setup loading, and thumbnail decoding run
+in background workers. An indeterminate loading indicator beside the bottom-left
+status text shows pending work. Rapid session edits are serialized with the latest
+pending selection retained; stale completions cannot override dashboard changes.
+
 ## Project Direction
 
 1. Add skin selection and structured car specifications.

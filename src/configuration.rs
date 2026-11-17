@@ -272,27 +272,6 @@ impl AppliedSession {
     }
 }
 
-pub fn apply_preset(
-    installation: &Installation,
-    preferences: &Preferences,
-    id: &str,
-) -> Result<AppliedSession> {
-    let _lock = try_lock_session(installation)?;
-    let preset = preferences
-        .presets
-        .iter()
-        .find(|preset| preset.id == id)
-        .with_context(|| format!("preset not found: {id}"))?;
-    apply_configuration(
-        installation,
-        &preset.car_id,
-        &preset.skin_id,
-        &track_key(&preset.track_id, &preset.track_layout),
-        &preset.conditions,
-    )?;
-    AppliedSession::load(installation, preset.conditions.clone())
-}
-
 pub fn apply_configuration_json(
     installation: &Installation,
     car_id: &str,
@@ -609,7 +588,7 @@ fn split_track_key(key: &str) -> (String, String) {
         .unwrap_or_else(|| (key.to_owned(), String::new()))
 }
 
-fn track_key(track: &str, layout: &str) -> String {
+pub(crate) fn track_key(track: &str, layout: &str) -> String {
     if layout.is_empty() {
         track.to_owned()
     } else {
