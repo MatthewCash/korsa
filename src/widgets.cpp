@@ -1154,7 +1154,7 @@ private:
         const QString presets = textProperty(backend_, "presets_json"); if (presets != presetsCache_) { presetsCache_ = presets; if (presetList_) { presetList_->clear(); for (const auto &value : QJsonDocument::fromJson(presets.toUtf8()).array()) { const auto item = value.toObject(); presetList_->addItem(item.value("name").toString(), item.value("id").toString()); } } }
         const QString appLayout = textProperty(backend_, "app_layout_json"); if (appLayout != appLayoutCache_) { appLayoutCache_ = appLayout; appLayout_ = QJsonDocument::fromJson(appLayout.toUtf8()).object(); }
         updateCarVariants(); updateSkins(); updateTrackLayouts();
-        carPreview_->setText(textProperty(backend_, "car_name") + "\n" + textProperty(backend_, "skin_name")); carPreview_->setIcon(QIcon(pixmapFromUrl(selectedCarPreview(), QSize(320, 145)))); trackPreview_->setText(textProperty(backend_, "track_name") + "\n" + textProperty(backend_, "track_layout")); trackPreview_->setIcon(QIcon(pixmapFromUrl(selectedTrackImage(), QSize(320, 145))));
+        carPreview_->setText(textProperty(backend_, "car_name") + "\n" + textProperty(backend_, "skin_name")); carPreview_->setIcon(QIcon(pixmapFromUrl(selectedCarPreview(), QSize(320, 145)))); trackPreview_->setText(textProperty(backend_, "track_name") + "\n" + textProperty(backend_, "track_layout")); trackPreview_->setIcon(QIcon(trackPixmap(selectedTrackImages(), QSize(320, 145))));
     }
 
     QVector<QJsonObject> groupedTracks() const
@@ -1551,14 +1551,15 @@ private:
         return textProperty(backend_, "car_preview");
     }
 
-    QString selectedTrackImage() const
+    QJsonObject selectedTrackImages() const
     {
         for (const auto &value : tracks_) {
             const QJsonObject track = value.toObject();
             if (track.value("id").toString() != selectedTrack_) continue;
-            if (!track.value("preview").toString().isEmpty()) return track.value("preview").toString();
+            return track;
         }
-        return textProperty(backend_, "track_preview");
+        return QJsonObject{{"preview", textProperty(backend_, "track_preview")},
+                           {"outline", textProperty(backend_, "track_outline")}};
     }
 
     Backend *backend_;
