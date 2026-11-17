@@ -205,6 +205,7 @@ pub fn load_conditions(installation: &Installation) -> Result<Conditions> {
         "__CM_WEATHER_TYPE",
         conditions.weather_type,
     );
+    synchronize_weather_type(installation, &mut conditions);
     Ok(conditions)
 }
 
@@ -304,9 +305,34 @@ pub fn apply_configuration_json_unlocked(
 ) -> Result<Conditions> {
     anyhow::ensure!(!car_id.is_empty(), "a car must be selected");
     anyhow::ensure!(!track_key.is_empty(), "a track must be selected");
-    let conditions = serde_json::from_str(conditions_json).context("invalid track conditions")?;
+    let mut conditions: Conditions =
+        serde_json::from_str(conditions_json).context("invalid track conditions")?;
+    synchronize_weather_type(installation, &mut conditions);
     apply_configuration(installation, car_id, skin_id, track_key, &conditions)?;
     Ok(conditions)
+}
+
+fn synchronize_weather_type(installation: &Installation, conditions: &mut Conditions) {
+    let id = std::path::Path::new(&conditions.weather_id);
+    if id.components().count() != 1
+        || !id
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return;
+    }
+    let metadata = session::read_optional(
+        &installation
+            .game_root
+            .join("content/weather")
+            .join(id)
+            .join("weather.ini"),
+    );
+    if let Some(weather_type) = session::ini_value(&metadata, "__LAUNCHER_CM", "WEATHER_TYPE")
+        .and_then(|value| value.parse::<i32>().ok())
+    {
+        conditions.weather_type = weather_type;
+    }
 }
 
 pub fn apply_dashboard_configuration(
@@ -713,6 +739,32 @@ mod tests {
             runtime_root: root.clone(),
             runtime_client: root.clone(),
         };
+        let storm = installation
+            .game_root
+            .join("content/weather/sol_43_heavy_thunderstorm");
+        fs::create_dir_all(&storm).unwrap();
+        fs::write(
+            storm.join("weather.ini"),
+            "[__LAUNCHER_CM]\nWEATHER_TYPE=2\n",
+        )
+        .unwrap();
+        let mut selected_weather = Conditions {
+            weather_id: "sol_43_heavy_thunderstorm".into(),
+            weather_type: 15,
+            ..Default::default()
+        };
+        synchronize_weather_type(&installation, &mut selected_weather);
+        assert_eq!(
+            selected_weather.weather_type, 2,
+            "preset changes must not retain Clear"
+        );
+        selected_weather.weather_id = "../sol_43_heavy_thunderstorm".into();
+        selected_weather.weather_type = 15;
+        synchronize_weather_type(&installation, &mut selected_weather);
+        assert_eq!(
+            selected_weather.weather_type, 15,
+            "do not read outside the weather folder"
+        );
         let conditions = Conditions {
             session_mode: "race".to_owned(),
             opponents: 2,
