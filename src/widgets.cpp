@@ -567,8 +567,14 @@ private:
         auto *layout = new QHBoxLayout(control); layout->setContentsMargins(0, 0, 0, 0);
         auto *slider = new QSlider(Qt::Horizontal); slider->setRange(box->minimum(), box->maximum()); slider->setValue(box->value());
         box->setFixedWidth(78);
-        connect(slider, &QSlider::valueChanged, box, &QSpinBox::setValue);
-        connect(box, &QSpinBox::valueChanged, slider, &QSlider::setValue);
+        connect(slider, &QSlider::valueChanged, box, [box, slider](int value) {
+            box->setValue(value);
+            if (!slider->isSliderDown()) box->editingFinished();
+        });
+        connect(slider, &QSlider::sliderReleased, box, [box] { box->editingFinished(); });
+        connect(box, &QSpinBox::valueChanged, slider, [slider](int value) {
+            const QSignalBlocker blocker(slider); slider->setValue(value);
+        });
         layout->addWidget(slider, 1); layout->addWidget(box);
         return control;
     }
@@ -580,8 +586,14 @@ private:
         const int scale = box->decimals() >= 2 ? 100 : box->decimals() == 1 ? 10 : 1;
         auto *slider = new QSlider(Qt::Horizontal); slider->setRange(qRound(box->minimum() * scale), qRound(box->maximum() * scale)); slider->setValue(qRound(box->value() * scale));
         box->setFixedWidth(88);
-        connect(slider, &QSlider::valueChanged, box, [box, scale](int value) { box->setValue(double(value) / scale); });
-        connect(box, &QDoubleSpinBox::valueChanged, slider, [slider, scale](double value) { slider->setValue(qRound(value * scale)); });
+        connect(slider, &QSlider::valueChanged, box, [box, slider, scale](int value) {
+            box->setValue(double(value) / scale);
+            if (!slider->isSliderDown()) box->editingFinished();
+        });
+        connect(slider, &QSlider::sliderReleased, box, [box] { box->editingFinished(); });
+        connect(box, &QDoubleSpinBox::valueChanged, slider, [slider, scale](double value) {
+            const QSignalBlocker blocker(slider); slider->setValue(qRound(value * scale));
+        });
         layout->addWidget(slider, 1); layout->addWidget(box);
         return control;
     }
@@ -996,17 +1008,36 @@ private:
 
     void populateModules()
     {
+        const QString selectedFile = moduleList_->currentItem()
+            ? moduleList_->currentItem()->data(Qt::UserRole).toString() : QString();
+        const int previousScroll = settingsScroll_->verticalScrollBar()->value();
         const QJsonArray source = settingsKind_->currentIndex() == 0 ? acModules_ : cspModules_;
         const QString needle = settingsSearch_->text();
+        const QSignalBlocker blocker(moduleList_);
         moduleList_->clear(); visibleModules_ = {};
+        int selectedRow = 0;
         for (const QJsonValue &value : source) {
             const QJsonObject module = value.toObject();
             const QByteArray searchable = QJsonDocument(module).toJson(QJsonDocument::Compact);
             if (!needle.isEmpty() && !QString::fromUtf8(searchable).contains(needle, Qt::CaseInsensitive)) continue;
             visibleModules_.append(module);
-            moduleList_->addItem(module.value("name").toString());
+            auto *item = new QListWidgetItem(module.value("name").toString(), moduleList_);
+            item->setData(Qt::UserRole, module.value("file").toString());
+            if (module.value("file").toString() == selectedFile) selectedRow = moduleList_->count() - 1;
         }
-        if (moduleList_->count()) moduleList_->setCurrentRow(0);
+        if (moduleList_->count()) {
+            moduleList_->setCurrentRow(selectedRow);
+            showModule(selectedRow);
+            if (moduleList_->currentItem()->data(Qt::UserRole).toString() == selectedFile) {
+                // setWidget() resets the scrollbar; restore after the replacement
+                // page has been laid out. The page context cancels stale restores.
+                QWidget *page = settingsScroll_->widget();
+                if (page) QTimer::singleShot(0, page, [this, page, previousScroll] {
+                    if (settingsScroll_->widget() == page)
+                        settingsScroll_->verticalScrollBar()->setValue(previousScroll);
+                });
+            }
+        }
     }
 
     void showModule(int row)
@@ -1032,8 +1063,17 @@ private:
                     connect(check, &QCheckBox::toggled, this, [this, file, sectionId, key](bool checked) { saveSetting(file, sectionId, key, checked ? "1" : "0"); });
                     form->addRow(label, check);
                 } else if (option.value("kind").toString() == "slider") {
-                    auto *box = new QDoubleSpinBox; box->setRange(option.value("minimum").toDouble(), option.value("maximum").toDouble()); box->setSingleStep(option.value("step").toDouble()); box->setDecimals(option.value("decimals").toInt()); box->setValue(option.value("value").toString().toDouble()); box->setSuffix(option.value("unit").toString());
-                    connect(box, &QDoubleSpinBox::editingFinished, this, [this, file, sectionId, key, box] { saveSetting(file, sectionId, key, QString::number(box->value(), 'f', box->decimals())); });
+                    const double multiplier = option.value("multiplier").toDouble(1.0);
+                    const int precision = option.value("decimals").toInt();
+                    auto *box = new QDoubleSpinBox;
+                    box->setDecimals(multiplier == 100.0 ? qMax(0, precision - 2) : precision);
+                    box->setRange(option.value("minimum").toDouble() * multiplier, option.value("maximum").toDouble() * multiplier);
+                    box->setSingleStep(option.value("step").toDouble() * multiplier);
+                    box->setValue(option.value("value").toString().toDouble() * multiplier);
+                    box->setSuffix(option.value("unit").toString());
+                    connect(box, &QDoubleSpinBox::editingFinished, this, [this, file, sectionId, key, box, multiplier, precision] {
+                        saveSetting(file, sectionId, key, QString::number(box->value() / multiplier, 'f', precision));
+                    });
                     form->addRow(label, sliderControl(box));
                 } else {
                     auto *edit = new QLineEdit(option.value("value").toString());
@@ -1048,9 +1088,21 @@ private:
 
     void showControls()
     {
+        const auto *oldPage = settingsScroll_->widget();
+        const bool restoring = oldPage && oldPage->objectName() == "control-settings-page";
+        const int outerScroll = restoring ? settingsScroll_->verticalScrollBar()->value() : 0;
+        const auto *oldTabs = restoring ? oldPage->findChild<QTabWidget *>("control-settings-tabs") : nullptr;
+        const int selectedTab = oldTabs ? oldTabs->currentIndex() : 0;
+        struct TablePosition { int vertical = 0; int horizontal = 0; int row = -1; int column = -1; };
+        QVector<TablePosition> positions;
+        for (const QString &name : {QStringLiteral("control-axes"), QStringLiteral("control-bindings")}) {
+            const auto *table = restoring ? oldPage->findChild<QTableWidget *>(name) : nullptr;
+            positions.append(table ? TablePosition{table->verticalScrollBar()->value(), table->horizontalScrollBar()->value(), table->currentRow(), table->currentColumn()} : TablePosition{});
+        }
         QMetaObject::invokeMethod(backend_, "setControlMonitoring", Q_ARG(bool, true));
         const QJsonObject controls = controls_;
         auto *content = new QWidget; auto *layout = new QVBoxLayout(content); layout->setContentsMargins(12, 8, 12, 12); layout->setSpacing(10);
+        content->setObjectName(QStringLiteral("control-settings-page"));
         auto *heading = new QLabel(tr("Controls")); QFont font = heading->font(); font.setPointSize(font.pointSize() + 6); font.setBold(true); heading->setFont(font); layout->addWidget(heading);
         auto *controller = new QGroupBox(tr("Controller Profile")); auto *controllerLayout = new QGridLayout(controller);
         auto *method = new QComboBox; method->addItem(tr("Wheel"), "WHEEL"); method->addItem(tr("Gamepad"), "X360"); method->addItem(tr("Keyboard"), "KEYBOARD"); method->setCurrentIndex(method->findData(controls.value("input_method").toString()));
@@ -1065,6 +1117,7 @@ private:
         QStringList connectedDevices; for (const QJsonValue &value : controls.value("devices").toArray()) { const auto device = value.toObject(); if (device.value("connected").toBool()) connectedDevices.append(device.value("name").toString()); }
         auto *devices = new QLabel(connectedDevices.isEmpty() ? tr("No connected controllers detected") : tr("Connected: %1").arg(connectedDevices.join(QStringLiteral("  |  ")))); devices->setWordWrap(true); devices->setForegroundRole(QPalette::PlaceholderText); layout->addWidget(devices);
         auto *tabs = new QTabWidget;
+        tabs->setObjectName(QStringLiteral("control-settings-tabs"));
         auto *axes = new QTableWidget; axes->setColumnCount(6); axes->setHorizontalHeaderLabels({tr("Function"), tr("Assignment"), tr("Live input"), tr("Invert"), tr("Assign"), tr("Clear")}); axes->verticalHeader()->hide(); axes->verticalHeader()->setDefaultSectionSize(38); axes->setAlternatingRowColors(true); axes->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents); axes->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch); axes->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Fixed); axes->horizontalHeader()->resizeSection(2, 110); axes->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Fixed); axes->horizontalHeader()->resizeSection(3, 62); axes->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Fixed); axes->horizontalHeader()->resizeSection(4, 86); axes->horizontalHeader()->setSectionResizeMode(5, QHeaderView::Fixed); axes->horizontalHeader()->resizeSection(5, 66);
         const QJsonArray axisData = controls.value("axes").toArray(); axes->setRowCount(axisData.size()); axisMeters_.clear();
         for (int row = 0; row < axisData.size(); ++row) { const auto axis = axisData.at(row).toObject(); axes->setItem(row, 0, new QTableWidgetItem(axis.value("label").toString())); axes->setItem(row, 1, new QTableWidgetItem(axis.value("assignment").toString())); auto *meter = new QProgressBar; meter->setRange(0, 100); meter->setValue(0); meter->setTextVisible(false); axes->setCellWidget(row, 2, meter); axisMeters_.append({meter, axis.value("joy").toInt(-1), axis.value("axis").toInt(-1)}); auto *invert = new QCheckBox; invert->setChecked(axis.value("inverted").toBool()); invert->setEnabled(axis.value("section").toString() != "STEER"); axes->setCellWidget(row, 3, invert); const QString section = axis.value("section").toString(); auto *assign = new QPushButton(tr("Assign...")); connect(assign, &QPushButton::clicked, this, [this, section, axis] { capture(section, "AXLE", axis.value("label").toString()); }); axes->setCellWidget(row, 4, assign); auto *clear = new QPushButton(tr("Clear")); connect(clear, &QPushButton::clicked, this, [this, section] { QMetaObject::invokeMethod(backend_, "clearControlBinding", Q_ARG(QString, section), Q_ARG(QString, QStringLiteral("AXLE"))); }); axes->setCellWidget(row, 5, clear); }
@@ -1074,7 +1127,25 @@ private:
         tabs->addTab(bindings, tr("Button Bindings"));
         auto *shifter = new QWidget; auto *shifterForm = new QFormLayout(shifter); const auto shifterData = controls.value("shifter").toObject(); auto *shifterActive = new QCheckBox; shifterActive->setChecked(shifterData.value("active").toBool()); connect(shifterActive, &QCheckBox::toggled, this, [this](bool checked) { invokeControlOption("SHIFTER", "ACTIVE", checked ? "1" : "0"); }); shifterForm->addRow(tr("Use H-pattern shifter"), shifterActive); for (const auto &value : shifterData.value("gears").toArray()) { const auto gear = value.toObject(); auto *row = new QWidget; auto *rowLayout = new QHBoxLayout(row); rowLayout->setContentsMargins(0, 0, 0, 0); rowLayout->addWidget(new QLabel(gear.value("assignment").toString()), 1); auto *assign = new QPushButton(tr("Assign...")); const QString key = gear.value("key").toString(); const QString label = gear.value("label").toString(); connect(assign, &QPushButton::clicked, this, [this, key, label] { capture("SHIFTER", key, label); }); rowLayout->addWidget(assign); shifterForm->addRow(label, row); } tabs->addTab(shifter, tr("H-Pattern Shifter"));
         auto *ffb = new QWidget; auto *ffbForm = new QFormLayout(ffb); const auto steering = controls.value("steering").toObject(); const auto feedback = controls.value("force_feedback").toObject(); for (const QString key : {"FF_GAIN", "FILTER_FF"}) { auto *box = new QDoubleSpinBox; box->setRange(0, 1); box->setSingleStep(0.01); box->setValue(steering.value(key).toString().toDouble()); connect(box, &QDoubleSpinBox::editingFinished, this, [this, key, box] { invokeControlOption("STEER", key, QString::number(box->value(), 'f', 2)); }); ffbForm->addRow(key, box); } for (auto it = feedback.begin(); it != feedback.end(); ++it) { auto *box = new QDoubleSpinBox; box->setRange(0, 1); box->setSingleStep(0.01); box->setValue(it.value().toString().toDouble()); const QString key = it.key(); connect(box, &QDoubleSpinBox::editingFinished, this, [this, key, box] { invokeControlOption("FF_EXPERIMENTAL", key, QString::number(box->value(), 'f', 2)); }); ffbForm->addRow(key, box); } tabs->addTab(ffb, tr("Force Feedback"));
+        axes->setObjectName(QStringLiteral("control-axes"));
+        bindings->setObjectName(QStringLiteral("control-bindings"));
+        tabs->setCurrentIndex(qBound(0, selectedTab, tabs->count() - 1));
+        const QVector<QTableWidget *> tables{axes, bindings};
+        for (int i = 0; i < tables.size(); ++i) {
+            const auto position = positions.at(i);
+            if (position.row >= 0 && position.row < tables[i]->rowCount()
+                    && position.column >= 0 && position.column < tables[i]->columnCount())
+                tables[i]->setCurrentCell(position.row, position.column);
+        }
         layout->addWidget(tabs); settingsScroll_->setWidget(content);
+        if (restoring) QTimer::singleShot(0, content, [this, content, tables, positions, outerScroll] {
+            if (settingsScroll_->widget() != content) return;
+            settingsScroll_->verticalScrollBar()->setValue(outerScroll);
+            for (int i = 0; i < tables.size(); ++i) {
+                tables[i]->verticalScrollBar()->setValue(positions.at(i).vertical);
+                tables[i]->horizontalScrollBar()->setValue(positions.at(i).horizontal);
+            }
+        });
     }
 
     void showAppLayout()
@@ -1207,7 +1278,22 @@ private:
         const QString replayJson = textProperty(backend_, "replays_json"); if (replayJson != replayCache_) { replayCache_ = replayJson; replayList_->clear(); for (const auto &value : QJsonDocument::fromJson(replayJson.toUtf8()).array()) replayList_->addItem(value.toObject().value("name").toString()); }
         const QString conditionsJson = textProperty(backend_, "conditions_json"); if (conditionsJson != conditionsCache_) { conditionsCache_ = conditionsJson; conditions_ = QJsonDocument::fromJson(conditionsJson.toUtf8()).object(); updateDrive(); }
         const QString weatherJson = textProperty(backend_, "weather_json"); if (weatherJson != weatherCache_) { weatherCache_ = weatherJson; const auto array = QJsonDocument::fromJson(weatherJson.toUtf8()).array(); weather_->clear(); for (const auto &value : array) { const auto item = value.toObject(); weather_->addItem(item.value("name").toString(), item.value("id").toString()); weather_->setItemData(weather_->count() - 1, item.value("weather_type").toInt(15), Qt::UserRole + 1); } updateDrive(); }
-        const QString ac = textProperty(backend_, "ac_settings_json"), csp = textProperty(backend_, "csp_settings_json"), controls = textProperty(backend_, "controls_json"); if (ac != acCache_ || csp != cspCache_) { acCache_ = ac; cspCache_ = csp; acModules_ = QJsonDocument::fromJson(ac.toUtf8()).array(); cspModules_ = QJsonDocument::fromJson(csp.toUtf8()).array(); populateModules(); } if (controls != controlsCache_) { controlsCache_ = controls; controls_ = QJsonDocument::fromJson(controls.toUtf8()).object(); if (navigation_->currentRow() == 8 && moduleList_->currentItem() && moduleList_->currentItem()->text().contains("Controls")) showControls(); }
+        const QString ac = textProperty(backend_, "ac_settings_json"), csp = textProperty(backend_, "csp_settings_json"), controls = textProperty(backend_, "controls_json");
+        const bool modulesChanged = ac != acCache_ || csp != cspCache_;
+        const bool controlsChanged = controls != controlsCache_;
+        if (controlsChanged) {
+            controlsCache_ = controls;
+            controls_ = QJsonDocument::fromJson(controls.toUtf8()).object();
+        }
+        if (modulesChanged) {
+            acCache_ = ac; cspCache_ = csp;
+            acModules_ = QJsonDocument::fromJson(ac.toUtf8()).array();
+            cspModules_ = QJsonDocument::fromJson(csp.toUtf8()).array();
+            populateModules();
+        } else if (controlsChanged && navigation_->currentRow() == 8 && moduleList_->currentItem()
+                && moduleList_->currentItem()->data(Qt::UserRole).toString() == "controls.ini") {
+            showControls();
+        }
         const QString controlInput = textProperty(backend_, "control_input_json"); if (controlInput != controlInputCache_) { controlInputCache_ = controlInput; const QJsonArray devices = QJsonDocument::fromJson(controlInput.toUtf8()).object().value("devices").toArray(); for (const AxisMeter &mapping : axisMeters_) { bool found = false; double position = 0.0; for (const auto &value : devices) { const QJsonObject device = value.toObject(); if (device.value("controller_index").toInt(-1) != mapping.controller) continue; const QJsonArray axes = device.value("axes").toArray(); if (mapping.axis >= 0 && mapping.axis < axes.size()) { position = axes.at(mapping.axis).toDouble(); found = true; } break; } mapping.meter->setEnabled(found); mapping.meter->setValue(qBound(0, qRound((position + 1.0) * 50.0), 100)); } for (const ButtonIndicator &mapping : buttonIndicators_) { bool found = false; bool pressed = false; for (const auto &value : devices) { const QJsonObject device = value.toObject(); if (device.value("controller_index").toInt(-1) != mapping.controller) continue; const QJsonArray buttons = device.value("buttons").toArray(); if (mapping.button >= 0 && mapping.button < buttons.size()) { pressed = buttons.at(mapping.button).toBool(); found = true; } break; } mapping.label->setEnabled(found); mapping.label->setText(pressed ? tr("Pressed") : tr("Released")); } }
         const QString servers = textProperty(backend_, "servers_json"); if (servers != serversCache_) { serversCache_ = servers; onlineServers_ = QJsonDocument::fromJson(servers.toUtf8()).array(); onlineTable_->setRowCount(onlineServers_.size()); for (int row = 0; row < onlineServers_.size(); ++row) { const auto server = onlineServers_.at(row).toObject(); const QStringList cars = [&server] { QStringList result; for (const auto &value : server.value("cars").toArray()) result.append(value.toString()); return result; }(); const QStringList values = {server.value("name").toString(), tr("%1/%2").arg(server.value("clients").toInt()).arg(server.value("capacity").toInt()), server.value("track").toString(), tr("%1 cars").arg(cars.size()), server.value("session").toString(), server.value("country").toString(), server.value("passworded").toBool() ? tr("Password") : tr("Open")}; for (int column = 0; column < values.size(); ++column) onlineTable_->setItem(row, column, new QTableWidgetItem(values.at(column))); onlineTable_->item(row, 0)->setData(Qt::UserRole, row); onlineTable_->item(row, 3)->setToolTip(cars.join(QStringLiteral(", "))); } }
         const QString setupJson = textProperty(backend_, "setups_json"); if (setupJson != setupsCache_) { setupsCache_ = setupJson; const auto setupItems = QJsonDocument::fromJson(setupJson.toUtf8()).array(); setupList_->setRowCount(setupItems.size()); QSet<QString> tracks; tracks.insert(QStringLiteral("generic")); for (int row = 0; row < setupItems.size(); ++row) { const auto setup = setupItems.at(row).toObject(); auto *name = new QTableWidgetItem(setup.value("name").toString()); name->setData(Qt::UserRole, setup.value("id").toString()); setupList_->setItem(row, 0, name); setupList_->setItem(row, 1, new QTableWidgetItem(setup.value("track").toString())); setupList_->setItem(row, 2, new QTableWidgetItem(QDateTime::fromSecsSinceEpoch(setup.value("modified").toInteger()).toString(QStringLiteral("yyyy-MM-dd HH:mm")))); tracks.insert(setup.value("track").toString()); } const QString currentTrack = setupTrack_->currentText(); setupTrack_->clear(); setupTrack_->addItems(tracks.values()); setupTrack_->setCurrentText(currentTrack.isEmpty() ? QStringLiteral("generic") : currentTrack); setupSummary_->setText(tr("%1 setups for %2").arg(setupItems.size()).arg(textProperty(backend_, "car_name"))); }
