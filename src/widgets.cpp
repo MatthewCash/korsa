@@ -737,9 +737,18 @@ private:
         connect(filter, &QComboBox::currentIndexChanged, this, [this, cars] { populateCatalog(cars ? carList_ : trackList_); });
         connect(sort, &QComboBox::currentIndexChanged, this, [this, cars] { populateCatalog(cars ? carList_ : trackList_); });
         connect(favoritesOnly, &QCheckBox::toggled, this, [this, cars] { populateCatalog(cars ? carList_ : trackList_); });
-        connect(list, &QListWidget::itemClicked, this, [this, cars](QListWidgetItem *item) { inspectCatalogItem(cars, item->data(Qt::UserRole).toJsonObject(), QString()); });
+        connect(list, &QListWidget::itemClicked, this, [this, cars](QListWidgetItem *item) {
+            if (item->data(Qt::UserRole + 2).toBool()) return;
+            inspectCatalogItem(cars, item->data(Qt::UserRole).toJsonObject(), QString());
+            commitCatalogItem(cars, false);
+        });
         connect(list, &QListWidget::itemDoubleClicked, this, [this, cars](QListWidgetItem *item) { inspectCatalogItem(cars, item->data(Qt::UserRole).toJsonObject(), QString()); commitCatalogItem(cars); });
         connect(layoutChoice, &QComboBox::currentIndexChanged, this, [this, cars](int index) { if (index >= 0) showCatalogDetails(cars); });
+        // Only explicit user choices apply; rebuilding the dropdown must not
+        // write a session or override a newer dashboard selection.
+        connect(layoutChoice, &QComboBox::activated, this, [this, cars](int index) {
+            if (index >= 0) commitCatalogItem(cars, false);
+        });
         connect(use, &QPushButton::clicked, this, [this, cars] { commitCatalogItem(cars); });
         connect(favorite, &QPushButton::clicked, this, [this, cars] { toggleCatalogFavorite(cars); });
         connect(dashboard, &QPushButton::clicked, this, [this, cars] { toggleCatalogDashboard(cars); });
@@ -1519,6 +1528,11 @@ private:
         if (cars && carCountLabel_) carCountLabel_->setText(tr("%1 models, %2 variants").arg(objects.size()).arg(cars_.size()));
         if (!cars && trackCountLabel_) trackCountLabel_->setText(tr("%1 tracks, %2 layouts").arg(groupedTracks().size()).arg(tracks_.size()));
         filterCatalogSearch(list);
+        // Finish the deferred item layout before restoring the viewport. Restoring
+        // the current item above otherwise scrolls it to the viewport's bottom.
+        list->doItemsLayout();
+        list->verticalScrollBar()->setValue(scrollPosition);
+        if (cars) syncManufacturerIndex();
     }
 
     void filterCatalogSearch(QListWidget *list)
