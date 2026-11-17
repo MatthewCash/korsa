@@ -107,10 +107,7 @@ pub fn load(installation: &Installation) -> Result<SessionInfo> {
             selected_ui.join("preview.png"),
             base_ui.join("preview.png"),
         ]),
-        track_outline: first_existing(&[
-            selected_ui.join("outline_cropped.png"),
-            selected_ui.join("outline.png"),
-        ]),
+        track_outline: first_existing(&[selected_ui.join("outline.png")]),
         csp_status,
     })
 }

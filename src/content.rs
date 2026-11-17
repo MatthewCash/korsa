@@ -401,7 +401,7 @@ fn load_tracks(
                 pitboxes: session::json_string(&metadata, "pitboxes").unwrap_or_default(),
                 direction: session::json_string(&metadata, "run").unwrap_or_default(),
                 year: json_scalar(&metadata, "year"),
-                outline: ["outline_cropped.png", "outline.png"]
+                outline: ["outline.png"]
                     .into_iter()
                     .map(|name| layout_root.join(name))
                     .find(|path| path.is_file())
@@ -543,6 +543,23 @@ mod tests {
     #[test]
     fn counts_catalog_items_for_frontend() {
         assert_eq!(count(&[]), 0);
+    }
+
+    #[test]
+    fn track_outlines_ignore_cropped_files() {
+        let root = std::env::temp_dir().join(format!("korsa-outlines-{}", std::process::id()));
+        let ui = root.join("track/ui/normal");
+        fs::create_dir_all(&ui).unwrap();
+        fs::write(ui.join("ui_track.json"), r#"{"name":"Test Track"}"#).unwrap();
+        fs::write(ui.join("outline_cropped.png"), "unused cropped image").unwrap();
+        fs::write(ui.join("outline.png"), "full outline").unwrap();
+        let tracks = load_tracks(&root, &Default::default(), &Default::default()).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert!(tracks[0].outline.ends_with("/outline.png"));
+        fs::remove_file(ui.join("outline.png")).unwrap();
+        let tracks = load_tracks(&root, &Default::default(), &Default::default()).unwrap();
+        assert!(tracks[0].outline.is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

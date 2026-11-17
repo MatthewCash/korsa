@@ -2,6 +2,7 @@
 
 #include "korsa/src/backend.cxxqt.h"
 #include "window_effects.h"
+#include "outline_image.h"
 
 #include <QApplication>
 #include <QCheckBox>
@@ -41,6 +42,7 @@
 #include <QPixmapCache>
 #include <QResizeEvent>
 #include <QScrollArea>
+#include <QScrollBar>
 #include <QSet>
 #include <QSignalBlocker>
 #include <QShortcut>
@@ -52,8 +54,10 @@
 #include <QTabWidget>
 #include <QTabBar>
 #include <QTableWidget>
+#include <QTextBrowser>
 #include <QTimeEdit>
 #include <QTimer>
+#include <QThreadPool>
 #include <QToolBar>
 #include <QToolButton>
 #include <QUrl>
@@ -85,42 +89,59 @@ void invokeOption(QObject *backend, const char *method, const QString &file,
                               Q_ARG(QString, key), Q_ARG(QString, value));
 }
 
-QPixmap pixmapFromUrl(const QString &value, const QSize &size)
+QSet<QString> pendingImages;
+QSet<QString> failedImages;
+quint64 imageRevision = 0;
+
+QPixmap pixmapFromUrl(const QString &value, const QSize &size, bool outlineHalo = false)
 {
     const QString path = QUrl(value).toLocalFile();
     if (path.isEmpty()) {
         return {};
     }
     const QString cacheKey = path + QStringLiteral("@")
-        + QString::number(size.width()) + QStringLiteral("x") + QString::number(size.height());
+        + QString::number(size.width()) + QStringLiteral("x") + QString::number(size.height())
+        + (outlineHalo ? QStringLiteral(":black-halo-2-auto-shape") : QString());
     QPixmap cached;
     if (QPixmapCache::find(cacheKey, &cached)) {
         return cached;
     }
-    QPixmap pixmap(path);
-    if (!pixmap.isNull()) {
-        pixmap = pixmap.scaled(size, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-        QPixmapCache::insert(cacheKey, pixmap);
-    }
-    return pixmap;
+    if (pendingImages.contains(cacheKey) || failedImages.contains(cacheKey)) return {};
+    pendingImages.insert(cacheKey);
+    static QThreadPool images;
+    images.setMaxThreadCount(4);
+    QPixmapCache::setCacheLimit(128 * 1024);
+    images.start([path, size, cacheKey, outlineHalo] {
+        QImageReader reader(path);
+        reader.setAutoTransform(true);
+        const QSize original = reader.size();
+        const QSize imageSize = outlineHalo ? QSize(qMax(1, size.width() - 4), qMax(1, size.height() - 4)) : size;
+        if (original.isValid()) reader.setScaledSize(original.scaled(imageSize, Qt::KeepAspectRatio));
+        QImage image = reader.read();
+        if (outlineHalo) image = outlinedTrackImage(image);
+        QMetaObject::invokeMethod(qApp, [image, cacheKey] {
+            pendingImages.remove(cacheKey);
+            if (image.isNull()) failedImages.insert(cacheKey);
+            else QPixmapCache::insert(cacheKey, QPixmap::fromImage(image));
+            ++imageRevision;
+        }, Qt::QueuedConnection);
+    });
+    return {};
 }
 
 QPixmap trackPixmap(const QJsonObject &track, const QSize &size)
 {
-    QPixmap preview = pixmapFromUrl(track.value("preview").toString(), size);
-    const QSize outlineSize(qRound(size.width() * 0.42), qRound(size.height() * 0.72));
-    const QPixmap outline = pixmapFromUrl(track.value("outline").toString(), outlineSize);
+    const QPixmap preview = pixmapFromUrl(track.value("preview").toString(), size);
+    const QPixmap outline = pixmapFromUrl(track.value("outline").toString(), size - QSize(8, 8), true);
     if (outline.isNull()) return preview;
-
     QPixmap combined(size);
     combined.fill(Qt::transparent);
     QPainter painter(&combined);
-    if (!preview.isNull()) {
+    if (!preview.isNull())
         painter.drawPixmap((size.width() - preview.width()) / 2,
                            (size.height() - preview.height()) / 2, preview);
-    }
-    painter.drawPixmap(size.width() - outline.width() - 6,
-                       size.height() - outline.height() - 6, outline);
+    painter.drawPixmap((size.width() - outline.width()) / 2,
+                       (size.height() - outline.height()) / 2, outline);
     return combined;
 }
 
@@ -1071,6 +1092,35 @@ private:
         if (onlineJoin_)
             onlineJoin_->setEnabled(!launching && onlineTable_->currentRow() >= 0 && onlineCar_->count() > 0);
         statusLabel_->setText(textProperty(backend_, "status")); cspLabel_->setText(textProperty(backend_, "csp_status")); busy_->setVisible(boolProperty(backend_, "scanning") || boolProperty(backend_, "launching") || contentBusy || onlineBusy);
+        if (imageRevisionSeen_ != imageRevision) {
+            imageRevisionSeen_ = imageRevision;
+            for (auto *list : {carList_, trackList_}) {
+                for (int i = 0; i < list->count(); ++i) {
+                    auto *item = list->item(i);
+                    if (item->data(Qt::UserRole + 2).toBool()) continue;
+                    const auto object = item->data(Qt::UserRole).toJsonObject();
+                    item->setIcon(QIcon(list == trackList_ ? trackPixmap(object, QSize(220, 125))
+                        : pixmapFromUrl(object.value("preview").toString(), QSize(220, 125))));
+                }
+                CatalogWidgets &catalog = list == carList_ ? carCatalog_ : trackCatalog_;
+                for (int i = 0; i < catalog.layouts->count(); ++i) {
+                    const auto object = catalog.layouts->itemData(i).toJsonObject();
+                    if (!catalog.cars) catalog.layouts->setItemIcon(i, QIcon(trackPixmap(object, QSize(144, 81))));
+                }
+                showCatalogDetails(catalog.cars);
+            }
+            // Refresh icon-bearing selectors without touching their selection.
+            for (auto *combo : {skin_, carVariant_, trackLayout_}) {
+                for (int i = 0; i < combo->count(); ++i) {
+                    if (combo == skin_) continue;
+                    const auto object = combo->itemData(i).toJsonObject();
+                    combo->setItemIcon(i, QIcon(combo == trackLayout_ ? trackPixmap(object, QSize(144, 81))
+                        : pixmapFromUrl(object.value("preview").toString(), QSize(144, 81))));
+                }
+            }
+            // Skin icons are repopulated by updateSkins on this refresh.
+            const QSignalBlocker blocker(skin_); skin_->clear();
+        }
         if (contentCspStatus_) contentCspStatus_->setText(textProperty(backend_, "csp_status"));
         if (contentError_) contentError_->setText(textProperty(backend_, "error_message"));
         if (onlineError_) onlineError_->setText(textProperty(backend_, "error_message"));
@@ -1242,7 +1292,8 @@ private:
                 text = object.value("name").toString() + tr("\n%1 layout(s)").arg(layouts);
                 if (!object.value("author").toString().isEmpty()) text += tr(" | by %1").arg(object.value("author").toString());
             }
-            auto *item = new QListWidgetItem(QIcon(pixmapFromUrl(object.value("preview").toString(), QSize(220, 125))), text);
+            auto *item = new QListWidgetItem(QIcon(cars ? pixmapFromUrl(object.value("preview").toString(), QSize(220, 125))
+                : trackPixmap(object, QSize(220, 125))), text);
             item->setData(Qt::UserRole, object);
             item->setData(Qt::UserRole + 1, QString::fromUtf8(QJsonDocument(object).toJson(QJsonDocument::Compact)));
             item->setToolTip(object.value("favorite").toBool() ? tr("Favorite") : object.value("subtitle").toString());
@@ -1320,7 +1371,8 @@ private:
         if (catalog.selected.isEmpty()) return;
         QJsonObject object = catalog.selected;
         if (catalog.layouts->currentIndex() >= 0) object = catalog.layouts->currentData().toJsonObject();
-        catalog.image->setPixmap(pixmapFromUrl(object.value("preview").toString(), QSize(430, 240)));
+        catalog.image->setPixmap(cars ? pixmapFromUrl(object.value("preview").toString(), QSize(430, 240))
+                                     : trackPixmap(object, QSize(430, 240)));
         catalog.title->setText(object.value("name").toString());
         QStringList details;
         const QList<QPair<QString, QString>> values = cars
@@ -1515,6 +1567,7 @@ private:
     QLabel *showroomSelection_{}; QLabel *setupSummary_{}; QTableWidget *setupList_{}; QComboBox *setupTrack_{}; QLineEdit *setupName_{}; QPushButton *setupUse_{}; QPushButton *setupDelete_{}; QLabel *toolsError_{};
     QLineEdit *settingsSearch_{}; QTabBar *settingsKind_{}; QListWidget *moduleList_{}; QScrollArea *settingsScroll_{}; QLineEdit *presetName_{}; QComboBox *presetList_{};
     QString externalSessionRevision_;
+    quint64 imageRevisionSeen_ = 0;
     QTimer poll_; QTimer racePoll_; QTimer applyTimer_; bool updating_ = false;
     bool cspReleaseRequested_ = false;
     QString selectedCar_, selectedSkin_, selectedTrack_, carsCache_, tracksCache_, replayCache_, conditionsCache_, weatherCache_, acCache_, cspCache_, controlsCache_, controlInputCache_, presetsCache_, appLayoutCache_, contentPreviewCache_, contentHistoryCache_, cspReleasesCache_, serversCache_, setupsCache_;
