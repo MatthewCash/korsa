@@ -18,6 +18,8 @@ pub struct Preferences {
     pub dashboard_cars: BTreeSet<String>,
     #[serde(default)]
     pub dashboard_tracks: BTreeSet<String>,
+    #[serde(default)]
+    pub hidden_cars: BTreeSet<String>,
     pub presets: Vec<SessionPreset>,
 }
 
@@ -196,6 +198,16 @@ pub fn atomic_write(path: &Path, contents: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_cars_round_trip_and_old_preferences_still_load() {
+        let mut preferences: Preferences = serde_json::from_str(r#"{"presets":[]}"#).unwrap();
+        assert!(preferences.hidden_cars.is_empty());
+        preferences.hidden_cars.insert("test_car".into());
+        let restored: Preferences =
+            serde_json::from_str(&serde_json::to_string(&preferences).unwrap()).unwrap();
+        assert!(restored.hidden_cars.contains("test_car"));
+    }
 
     #[test]
     fn dashboard_choices_are_limited_to_six() {

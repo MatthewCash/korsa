@@ -32,6 +32,7 @@ struct CatalogItem {
     preview: String,
     favorite: bool,
     dashboard: bool,
+    hidden: bool,
     parent: String,
     transmission: String,
     skin: String,
@@ -68,13 +69,16 @@ struct SkinItem {
 pub fn load(installation: &Installation, preferences: &Preferences) -> Result<Catalog> {
     let liveries = Liveries::load(installation)?;
     let current = session::load(installation).ok();
-    let cars = load_cars(
+    let mut cars = load_cars(
         &installation.game_root.join("content/cars"),
         &preferences.favorite_cars,
         &preferences.dashboard_cars,
         &liveries,
         current.as_ref(),
     )?;
+    for car in &mut cars {
+        car.hidden = preferences.hidden_cars.contains(&car.id);
+    }
     let tracks = load_tracks(
         &installation.game_root.join("content/tracks"),
         &preferences.favorite_tracks,
@@ -128,7 +132,7 @@ pub fn dashboard_json(installation: &Installation, preferences: &Preferences) ->
         cars: catalog
             .cars
             .iter()
-            .filter(|item| item.dashboard)
+            .filter(|item| item.dashboard && !item.hidden)
             .map(|item| DashboardItem {
                 id: &item.id,
                 name: &item.name,
@@ -709,6 +713,31 @@ mod tests {
         assert_eq!(options["selection"]["car_id"], "outside_pins");
         assert_eq!(options["selection"]["track_key"], "track4/layout");
         assert_eq!(options["selection"]["start_minutes"], 0);
+        preferences.hidden_cars.insert("car0".into());
+        let catalog = load(&installation, &preferences).unwrap();
+        let cars: serde_json::Value = serde_json::from_str(&catalog.cars_json).unwrap();
+        assert_eq!(
+            cars.as_array()
+                .unwrap()
+                .iter()
+                .find(|car| car["id"] == "car0")
+                .unwrap()["hidden"],
+            true
+        );
+        let options: serde_json::Value =
+            serde_json::from_str(&dashboard_json(&installation, &preferences).unwrap()).unwrap();
+        assert_eq!(options["cars"].as_array().unwrap().len(), 5);
+        assert!(
+            options["cars"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|car| car["id"] != "car0")
+        );
+        preferences.hidden_cars.clear();
+        let options: serde_json::Value =
+            serde_json::from_str(&dashboard_json(&installation, &preferences).unwrap()).unwrap();
+        assert_eq!(options["cars"].as_array().unwrap().len(), 6);
         fs::remove_dir_all(root).unwrap();
     }
 

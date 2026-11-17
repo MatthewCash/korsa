@@ -193,6 +193,19 @@ QScrollArea *scrollPage(QWidget *content)
     return area;
 }
 
+// Variable-sized items allow full-width manufacturer headers in the icon grid.
+class CatalogGrid final : public QListWidget {
+public:
+    using QListWidget::QListWidget;
+protected:
+    void resizeEvent(QResizeEvent *event) override {
+        QListWidget::resizeEvent(event);
+        for (int i = 0; i < count(); ++i)
+            if (item(i)->data(Qt::UserRole + 2).toBool())
+                item(i)->setSizeHint(QSize(qMax(235, viewport()->width() - 16), 36));
+    }
+};
+
 class MainWindow final : public QMainWindow {
 public:
     explicit MainWindow(Backend *backend)
@@ -236,13 +249,16 @@ private:
         QCheckBox *favoritesOnly{};
         QLabel *image{};
         QLabel *title{};
-        QLabel *details{};
+        QTextBrowser *details{};
         QComboBox *layouts{};
         QPushButton *favorite{};
         QPushButton *dashboard{};
         QPushButton *use{};
         QJsonObject selected;
         bool cars{};
+        QCheckBox *showHidden{};
+        QPushButton *hide{};
+        QPushButton *remove{};
     };
 
     struct AxisMeter {
@@ -595,6 +611,7 @@ private:
             filter->addItem(tr("Sequential"), QStringLiteral("sequential"));
         }
         auto *sort = new QComboBox;
+        if (cars) sort->addItem(tr("Manufacturer"), QStringLiteral("manufacturer"));
         sort->addItem(tr("Name"), QStringLiteral("name"));
         sort->addItem(tr("Author"), QStringLiteral("author"));
         if (cars) sort->addItem(tr("Power"), QStringLiteral("power"));
@@ -604,15 +621,17 @@ private:
         header->addWidget(filter);
         header->addWidget(sort);
         header->addWidget(favoritesOnly);
-        auto *list = new QListWidget;
+        auto *showHidden = cars ? new QCheckBox(tr("Show hidden cars")) : nullptr;
+        if (showHidden) header->addWidget(showHidden);
+        auto *list = new CatalogGrid;
         list->setViewMode(QListView::IconMode);
         list->setMovement(QListView::Static);
         list->setDragDropMode(QAbstractItemView::NoDragDrop);
         list->setResizeMode(QListView::Adjust);
         list->setIconSize(QSize(190, 108));
-        list->setGridSize(QSize(235, 184));
+        if (!cars) list->setGridSize(QSize(235, 184));
         list->setSpacing(4);
-        list->setUniformItemSizes(true);
+        list->setUniformItemSizes(!cars);
         list->setSelectionMode(QAbstractItemView::SingleSelection);
         list->setWordWrap(true);
         auto *details = new QWidget;
@@ -629,10 +648,12 @@ private:
             layoutChoice->setIconSize(QSize(144, 81));
             layoutChoice->setMinimumHeight(88);
         }
-        auto *detailText = new QLabel;
-        detailText->setWordWrap(true);
+        auto *detailText = new QTextBrowser;
+        detailText->setFrameShape(QFrame::NoFrame);
+        detailText->setStyleSheet(QStringLiteral("QTextBrowser { background: transparent; border: none; }"));
+        detailText->setOpenLinks(false);
+        detailText->setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
         detailText->setTextInteractionFlags(Qt::TextSelectableByMouse);
-        detailText->setAlignment(Qt::AlignTop | Qt::AlignLeft);
         auto *favorite = new QPushButton(QIcon::fromTheme("rating"), tr("Add Favorite"));
         auto *dashboard = new QPushButton(QIcon::fromTheme("view-grid"), tr("Add to Dashboard"));
         auto *use = new QPushButton(QIcon::fromTheme("dialog-ok-apply"), cars ? tr("Use This Car") : tr("Use This Track"));
@@ -644,13 +665,56 @@ private:
         detailsLayout->addWidget(favorite);
         detailsLayout->addWidget(dashboard);
         detailsLayout->addWidget(use);
+        auto *hideCar = cars ? new QPushButton(tr("Hide Car")) : nullptr;
+        auto *deleteCar = cars ? new QPushButton(tr("Delete Car Permanently…")) : nullptr;
+        if (cars) {
+            hideCar->setEnabled(false); deleteCar->setEnabled(false);
+            detailsLayout->addWidget(hideCar); detailsLayout->addWidget(deleteCar);
+            connect(hideCar, &QPushButton::clicked, this, [this] { manageSelectedCar(false); });
+            connect(deleteCar, &QPushButton::clicked, this, [this] { manageSelectedCar(true); });
+        }
         auto *splitter = new QSplitter;
-        splitter->addWidget(list); splitter->addWidget(details); splitter->setStretchFactor(0, 1);
+        if (cars) {
+            manufacturerSidebar_ = new QWidget;
+            auto *indexLayout = new QVBoxLayout(manufacturerSidebar_);
+            indexLayout->setContentsMargins(0, 0, 4, 0);
+            auto *title = new QLabel(tr("Manufacturers"));
+            QFont font = title->font(); font.setBold(true); title->setFont(font);
+            indexLayout->addWidget(title);
+            manufacturerIndex_ = new QListWidget;
+            manufacturerIndex_->setAccessibleName(tr("Jump to manufacturer"));
+            manufacturerIndex_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+            indexLayout->addWidget(manufacturerIndex_);
+            manufacturerSidebar_->setMinimumWidth(140);
+            splitter->addWidget(manufacturerSidebar_);
+            auto jump = [this, list](QListWidgetItem *entry) {
+                const QString manufacturer = entry->text();
+                for (int i = 0; i < list->count(); ++i) {
+                    auto *heading = list->item(i);
+                    if (heading->data(Qt::UserRole + 2).toBool() && !heading->isHidden()
+                            && heading->data(Qt::UserRole + 3).toString() == manufacturer) {
+                        list->doItemsLayout();
+                        list->scrollToItem(heading, QAbstractItemView::PositionAtTop);
+                        break;
+                    }
+                }
+            };
+            connect(manufacturerIndex_, &QListWidget::itemClicked, this, jump);
+            connect(manufacturerIndex_, &QListWidget::itemActivated, this, jump);
+            connect(list->verticalScrollBar(), &QScrollBar::valueChanged, this,
+                    [this] { syncManufacturerIndex(); });
+            connect(list->verticalScrollBar(), &QScrollBar::rangeChanged, this,
+                    [this] { QTimer::singleShot(0, this, [this] { syncManufacturerIndex(); }); });
+        }
+        splitter->addWidget(list); splitter->addWidget(details); splitter->setStretchFactor(cars ? 1 : 0, 1);
+        if (cars) splitter->setSizes({160, 700, 340});
         layout->addLayout(header);
         layout->addWidget(splitter, 1);
         stack_->addWidget(page);
         CatalogWidgets &catalog = cars ? carCatalog_ : trackCatalog_;
         catalog = {list, search, filter, sort, favoritesOnly, detailImage, detailTitle, detailText, layoutChoice, favorite, dashboard, use, {}, cars};
+        catalog.showHidden = showHidden; catalog.hide = hideCar; catalog.remove = deleteCar;
+        if (showHidden) connect(showHidden, &QCheckBox::toggled, this, [this] { populateCatalog(carList_); });
         if (cars) { carSearch_ = search; carList_ = list; carCountLabel_ = count; }
         else { trackSearch_ = search; trackList_ = list; trackCountLabel_ = count; }
         auto *searchTimer = new QTimer(search);
@@ -1201,6 +1265,7 @@ private:
         QMap<QString, int> positions;
         for (const auto &value : cars_) {
             const QJsonObject car = value.toObject();
+            if (car.value("hidden").toBool() && !carCatalog_.showHidden->isChecked()) continue;
             const QString parent = car.value("parent").toString();
             const QString base = parent.isEmpty() ? car.value("id").toString() : parent;
             int position = positions.value(base, -1);
@@ -1230,8 +1295,37 @@ private:
         return groups;
     }
 
+    void syncManufacturerIndex()
+    {
+        if (!manufacturerIndex_ || !carList_ || !carCatalog_.sort
+                || carCatalog_.sort->currentData().toString() != "manufacturer") return;
+        QString active;
+        // The active section is the last header to reach the viewport's top.
+        // Keep it active while its cars scroll past, even when the header is offscreen.
+        for (int i = 0; i < carList_->count(); ++i) {
+            const auto *heading = carList_->item(i);
+            if (!heading->data(Qt::UserRole + 2).toBool() || heading->isHidden()) continue;
+            const QRect rect = carList_->visualItemRect(heading);
+            if (!rect.isValid()) continue;
+            if (active.isEmpty() || rect.top() <= 4)
+                active = heading->data(Qt::UserRole + 3).toString();
+            if (rect.top() > 4) break;
+        }
+        if (active.isEmpty()) return;
+        for (int i = 0; i < manufacturerIndex_->count(); ++i) {
+            auto *entry = manufacturerIndex_->item(i);
+            if (entry->text() != active) continue;
+            // Programmatic selection must never trigger a jump in the main grid.
+            const QSignalBlocker blocker(manufacturerIndex_);
+            if (manufacturerIndex_->currentItem() != entry) manufacturerIndex_->setCurrentItem(entry);
+            manufacturerIndex_->scrollToItem(entry, QAbstractItemView::EnsureVisible);
+            break;
+        }
+    }
+
     void populateCatalog(QListWidget *list)
     {
+        const int scrollPosition = list->verticalScrollBar()->value();
         const bool cars = list == carList_;
         CatalogWidgets &catalog = cars ? carCatalog_ : trackCatalog_;
         const QString browsedChoice = catalog.layouts->currentIndex() >= 0
@@ -1258,6 +1352,10 @@ private:
         }), objects.end());
         const QString ordering = catalog.sort ? catalog.sort->currentData().toString() : QStringLiteral("name");
         std::sort(objects.begin(), objects.end(), [&](const QJsonObject &left, const QJsonObject &right) {
+            if (ordering == "manufacturer") {
+                const int brand = left.value("subtitle").toString().compare(right.value("subtitle").toString(), Qt::CaseInsensitive);
+                if (brand != 0) return brand < 0;
+            }
             if (ordering == "favorite" && left.value("favorite").toBool() != right.value("favorite").toBool()) return left.value("favorite").toBool();
             if (ordering == "power") return catalogNumber(left.value("power").toString()) > catalogNumber(right.value("power").toString());
             const QString key = ordering == "author" ? QStringLiteral("author") : ordering == "power" ? QStringLiteral("power") : QStringLiteral("name");
@@ -1281,8 +1379,30 @@ private:
         catalog.favorite->setEnabled(false);
         catalog.dashboard->setEnabled(false);
         catalog.use->setEnabled(false);
+        if (cars) { catalog.hide->setEnabled(false); catalog.remove->setEnabled(false); }
         list->clear();
+        QString lastManufacturer;
+        bool firstManufacturer = true;
         for (const QJsonObject &object : objects) {
+            if (cars && ordering == "manufacturer") {
+                QString manufacturer = object.value("subtitle").toString().trimmed();
+                if (manufacturer.isEmpty()) manufacturer = tr("Unknown manufacturer");
+                if (firstManufacturer || manufacturer.compare(lastManufacturer, Qt::CaseInsensitive) != 0) {
+                    auto *heading = new QListWidgetItem(list);
+                    heading->setFlags(Qt::ItemIsEnabled);
+                    heading->setData(Qt::UserRole + 2, true);
+                    heading->setData(Qt::UserRole + 3, manufacturer);
+                    heading->setSizeHint(QSize(qMax(235, list->viewport()->width() - 16), 36));
+                    auto *label = new QLabel(manufacturer);
+                    label->setTextFormat(Qt::PlainText);
+                    label->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+                    label->setContentsMargins(8, 0, 0, 0);
+                    QFont font = label->font(); font.setBold(true); font.setPointSize(font.pointSize() + 2);
+                    label->setFont(font);
+                    list->setItemWidget(heading, label);
+                    lastManufacturer = manufacturer; firstManufacturer = false;
+                }
+            }
             QString text;
             if (cars) {
                 QStringList facts;
@@ -1301,6 +1421,7 @@ private:
             auto *item = new QListWidgetItem(QIcon(cars ? pixmapFromUrl(object.value("preview").toString(), QSize(220, 125))
                 : trackPixmap(object, QSize(220, 125))), text);
             item->setData(Qt::UserRole, object);
+            if (cars) item->setSizeHint(QSize(235, 184));
             item->setData(Qt::UserRole + 1, QString::fromUtf8(QJsonDocument(object).toJson(QJsonDocument::Compact)));
             item->setToolTip(object.value("favorite").toBool() ? tr("Favorite") : object.value("subtitle").toString());
             list->addItem(item);
@@ -1321,11 +1442,36 @@ private:
         bool selectedHidden = false;
         for (int index = 0; index < list->count(); ++index) {
             QListWidgetItem *item = list->item(index);
+            if (item->data(Qt::UserRole + 2).toBool()) continue;
             const bool hidden = !needle.isEmpty()
                 && !item->data(Qt::UserRole + 1).toString().contains(needle, Qt::CaseInsensitive);
             item->setHidden(hidden);
             selectedHidden = selectedHidden || (hidden && item->isSelected());
             if (!hidden) ++visible;
+        }
+        // Hide headers whose entire manufacturer group was filtered out.
+        for (int index = 0; index < list->count(); ++index) {
+            auto *heading = list->item(index);
+            if (!heading->data(Qt::UserRole + 2).toBool()) continue;
+            bool anyVisible = false;
+            for (int next = index + 1; next < list->count() && !list->item(next)->data(Qt::UserRole + 2).toBool(); ++next)
+                anyVisible = anyVisible || !list->item(next)->isHidden();
+            heading->setHidden(!anyVisible);
+        }
+        if (cars && manufacturerIndex_) {
+            const bool grouped = catalog.sort->currentData().toString() == "manufacturer";
+            manufacturerSidebar_->setVisible(grouped);
+            const QString current = manufacturerIndex_->currentItem() ? manufacturerIndex_->currentItem()->text() : QString();
+            const int scroll = manufacturerIndex_->verticalScrollBar()->value();
+            const QSignalBlocker blocker(manufacturerIndex_);
+            manufacturerIndex_->clear();
+            for (int index = 0; index < list->count(); ++index) {
+                const auto *heading = list->item(index);
+                if (!heading->data(Qt::UserRole + 2).toBool() || heading->isHidden()) continue;
+                auto *entry = new QListWidgetItem(heading->data(Qt::UserRole + 3).toString(), manufacturerIndex_);
+                if (entry->text() == current) manufacturerIndex_->setCurrentItem(entry);
+            }
+            manufacturerIndex_->verticalScrollBar()->setValue(scroll);
         }
         if (selectedHidden) {
             list->clearSelection();
@@ -1380,24 +1526,67 @@ private:
         catalog.image->setPixmap(cars ? pixmapFromUrl(object.value("preview").toString(), QSize(430, 240))
                                      : trackPixmap(object, QSize(430, 240)));
         catalog.title->setText(object.value("name").toString());
-        QStringList details;
+        QString details = QStringLiteral("<table width=\"100%\" cellspacing=\"6\" cellpadding=\"9\">");
+        const QString muted = catalog.details->palette().color(QPalette::PlaceholderText).name();
+        const QString background = catalog.details->palette().color(QPalette::AlternateBase).name();
+        int cells = 0;
         const QList<QPair<QString, QString>> values = cars
             ? QList<QPair<QString, QString>>{{tr("Brand"), object.value("subtitle").toString()}, {tr("Author"), object.value("author").toString()}, {tr("Class"), object.value("class_name").toString()}, {tr("Power"), object.value("power").toString()}, {tr("Torque"), object.value("torque").toString()}, {tr("Weight"), object.value("weight").toString()}, {tr("Power/weight"), object.value("power_weight").toString()}, {tr("Top speed"), object.value("top_speed").toString()}, {tr("Acceleration"), object.value("acceleration").toString()}, {tr("Drivetrain"), object.value("drivetrain").toString()}, {tr("Transmission"), object.value("transmission").toString()}}
             : QList<QPair<QString, QString>>{{tr("Author"), object.value("author").toString()}, {tr("Version"), object.value("version").toString()}, {tr("Country"), object.value("country").toString()}, {tr("City"), object.value("city").toString()}, {tr("Length"), object.value("length").toString()}, {tr("Width"), object.value("width").toString()}, {tr("Pit boxes"), object.value("pitboxes").toString()}, {tr("Direction"), object.value("direction").toString()}, {tr("Year"), object.value("year").toString()}};
-        for (const auto &[label, value] : values) if (!value.isEmpty()) details.append(label + QStringLiteral(": ") + value);
-        if (!object.value("description").toString().isEmpty()) details.append(QStringLiteral("\n") + object.value("description").toString());
-        catalog.details->setText(details.join('\n'));
+        for (const auto &[label, value] : values) {
+            if (value.trimmed().isEmpty()) continue;
+            if (cells % 2 == 0) details += QStringLiteral("<tr>");
+            details += QStringLiteral("<td width=\"50%\" valign=\"top\" bgcolor=\"%1\">"
+                "<span style=\"font-size:9pt; color:%2\">%3</span><br/>"
+                "<span style=\"font-size:11pt; font-weight:600\">%4</span></td>")
+                .arg(background, muted, label.toUpper().toHtmlEscaped(), value.toHtmlEscaped());
+            if (++cells % 2 == 0) details += QStringLiteral("</tr>");
+        }
+        if (cells % 2) details += QStringLiteral("<td></td></tr>");
+        details += QStringLiteral("</table>");
+        const QString description = object.value("description").toString();
+        if (!description.trimmed().isEmpty())
+            details += QStringLiteral("<h4 style=\"color:%1\">%2</h4><p>%3</p>")
+                .arg(muted, tr("ABOUT").toHtmlEscaped(), description.toHtmlEscaped().replace('\n', QStringLiteral("<br/>")));
+        // Thumbnail completions must not reset a user's description scroll/selection.
+        if (catalog.details->property("metadataHtml").toString() != details) {
+            catalog.details->setProperty("metadataHtml", details);
+            catalog.details->setHtml(details);
+        }
         catalog.favorite->setEnabled(true); catalog.dashboard->setEnabled(true); catalog.use->setEnabled(true);
         catalog.favorite->setText(object.value("favorite").toBool() ? tr("Remove Favorite") : tr("Add Favorite"));
         catalog.dashboard->setText(object.value("dashboard").toBool() ? tr("Remove from Dashboard") : tr("Add to Dashboard"));
+        if (cars) {
+            catalog.hide->setEnabled(true); catalog.remove->setEnabled(true);
+            catalog.hide->setText(object.value("hidden").toBool() ? tr("Unhide Car") : tr("Hide Car"));
+            catalog.use->setEnabled(!object.value("hidden").toBool());
+        }
     }
 
-    void commitCatalogItem(bool cars)
+    void manageSelectedCar(bool remove)
+    {
+        if (carCatalog_.selected.isEmpty()) return;
+        const auto car = carCatalog_.layouts->currentData().toJsonObject();
+        const QString id = car.value("id").toString();
+        if (id.isEmpty()) return;
+        const bool hidden = car.value("hidden").toBool();
+        const QString action = remove ? QStringLiteral("delete") : hidden ? QStringLiteral("unhide") : QStringLiteral("hide");
+        const QString message = remove
+            ? tr("Permanently delete %1 (%2) and its entire content/cars/%2 folder, including all skins and modifications?\n\nThis cannot be undone. Other mods may depend on this car. Steam may restore official cars during verification. Your personal setups and replays will be kept.")
+            : hidden ? tr("Unhide %1 (%2) in Korsa?")
+                     : tr("Hide %1 (%2) from Korsa's car choices and dashboard?\n\nFiles stay on disk. Use Show hidden cars to restore it. The current session is not changed.");
+        if (QMessageBox::warning(this, remove ? tr("Delete car permanently") : hidden ? tr("Unhide car") : tr("Hide car"),
+                message.arg(car.value("name").toString(), id), QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel) != QMessageBox::Yes) return;
+        QMetaObject::invokeMethod(backend_, "manageCar", Q_ARG(QString, id), Q_ARG(QString, action));
+    }
+
+    void commitCatalogItem(bool cars, bool showDrive = true)
     {
         CatalogWidgets &catalog = cars ? carCatalog_ : trackCatalog_;
         if (catalog.selected.isEmpty()) return;
         const QJsonObject choice = catalog.layouts->currentData().toJsonObject();
         if (choice.isEmpty()) return;
+        if (cars && choice.value("hidden").toBool()) return;
         if (cars) {
             const QString car = choice.value("id").toString();
             if (car != selectedCar_) selectedSkin_.clear();
@@ -1406,7 +1595,7 @@ private:
             selectedTrack_ = choice.value("id").toString();
         }
         applyDrive();
-        navigation_->setCurrentRow(0);
+        if (showDrive) navigation_->setCurrentRow(0);
     }
 
     void toggleCatalogFavorite(bool cars)
@@ -1477,7 +1666,7 @@ private:
         for (const auto &value : cars_) {
             const QJsonObject car = value.toObject();
             if (car.value("id").toString() == base || car.value("parent").toString() == base)
-                variants.append(car);
+                if (!car.value("hidden").toBool()) variants.append(car);
         }
         bool matches = carVariant_->count() == variants.size();
         for (int index = 0; matches && index < variants.size(); ++index)
@@ -1568,6 +1757,8 @@ private:
     QToolButton *carPreview_{}; QToolButton *trackPreview_{}; QLabel *launchSummary_{}; QPushButton *driveButton_{}; QAction *driveAction_{}; QComboBox *mode_{}; QComboBox *carVariant_{}; QComboBox *skin_{}; QComboBox *trackLayout_{}; QComboBox *weather_{}; QSpinBox *opponents_{}; QSpinBox *ai_{}; QSpinBox *laps_{}; QSpinBox *duration_{}; QSpinBox *air_{}; QSpinBox *road_{}; QCheckBox *penalties_{}; QTimeEdit *time_{};
     QListWidget *carList_{}; QListWidget *trackList_{}; QListWidget *replayList_{}; QLineEdit *carSearch_{}; QLineEdit *trackSearch_{}; QLabel *carCountLabel_{}; QLabel *trackCountLabel_{};
     CatalogWidgets carCatalog_, trackCatalog_;
+    QWidget *manufacturerSidebar_{};
+    QListWidget *manufacturerIndex_{};
     QLabel *contentCspStatus_{}; QLineEdit *contentArchivePath_{}; QLabel *contentPreview_{}; QPushButton *contentInstall_{}; QListWidget *contentHistory_{}; QPushButton *contentRollback_{}; QLabel *contentError_{}; int contentReplacements_ = 0;
     QTableWidget *cspReleaseList_{}; QPushButton *cspInstallRelease_{};
     QLineEdit *onlineSearch_{}; QTableWidget *onlineTable_{}; QLabel *onlineDetails_{}; QComboBox *onlineCar_{}; QLineEdit *onlinePassword_{}; QPushButton *onlineJoin_{}; QLabel *onlineError_{};

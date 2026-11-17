@@ -86,6 +86,20 @@ The outgoing car's existing livery is remembered on the first switch too. If a
 remembered skin was removed, Korsa uses an installed fallback instead. Dashboard
 thumbnails show each car's current/remembered livery, with its name in the tooltip.
 
+## Car library management
+
+Cars are grouped by manufacturer by default; other sort modes remain available.
+The car details pane has confirmed **Hide Car** / **Unhide Car** and **Delete Car
+Permanently** actions. Use **Show hidden cars** to manage hidden entries. Hiding
+only changes Korsa preferences, excludes the car from dashboard/variant choices,
+and does not modify the current session or any installed files.
+
+Deletion removes only the selected variant's `content/cars/<id>` directory and
+all of its skins/modifications. Personal setups and replays are retained. Close
+AC and select another session car first. Symlinked car folders are rejected;
+other mods may depend on a deleted car, and Steam may restore official content
+during verification. No cars are deleted until the confirmation is accepted.
+
 Session selections, preset application, setup loading, and thumbnail decoding run
 in background workers. An indeterminate loading indicator beside the bottom-left
 status text shows pending work. Rapid session edits are serialized with the latest

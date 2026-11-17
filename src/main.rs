@@ -1,6 +1,7 @@
 mod ac_settings;
 mod app_layout;
 mod backend;
+mod car_management;
 mod configuration;
 mod content;
 mod controller_launch;

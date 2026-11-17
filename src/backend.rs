@@ -104,6 +104,10 @@ pub mod ffi {
         fn toggle_favorite(self: Pin<&mut Self>, kind: &QString, id: &QString);
 
         #[qinvokable]
+        #[cxx_name = "manageCar"]
+        fn manage_car(self: Pin<&mut Self>, id: &QString, action: &QString);
+
+        #[qinvokable]
         #[cxx_name = "toggleDashboardItem"]
         fn toggle_dashboard_item(self: Pin<&mut Self>, kind: &QString, id: &QString);
 
@@ -1439,6 +1443,55 @@ impl ffi::Backend {
             self.as_mut().set_status(QString::from("Launch failed"));
             self.as_mut()
                 .set_error_message(QString::from(error.to_string()));
+        }
+    }
+
+    pub fn manage_car(mut self: Pin<&mut Self>, id: &QString, action: &QString) {
+        if *self.content_busy() || *self.launching() || *self.scanning() {
+            return;
+        }
+        let Some(installation) = self.rust().installation.clone() else {
+            return;
+        };
+        let id = id.to_string();
+        let action = action.to_string();
+        if !self.rust().catalog.contains("car", &id) {
+            return;
+        }
+        self.as_mut().set_content_busy(true);
+        self.as_mut().set_error_message(QString::default());
+        let qt_thread = self.qt_thread();
+        if let Err(error) = runtime::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let _lock = configuration::lock_session(&installation)?;
+                match action.as_str() {
+                    "delete" => crate::car_management::delete(&installation, &id),
+                    "hide" | "unhide" => {
+                        let mut preferences = preferences::Preferences::load()?;
+                        crate::car_management::set_hidden(&mut preferences, &id, action == "hide")
+                    }
+                    _ => anyhow::bail!("unknown car operation"),
+                }
+            })
+            .await;
+            let _ = qt_thread.queue(move |mut backend| {
+                backend.as_mut().set_content_busy(false);
+                match result {
+                    Ok(Ok(())) => {
+                        backend.as_mut().set_status(QString::from("Car updated"));
+                        backend.as_mut().discover();
+                    }
+                    Ok(Err(error)) => {
+                        set_operation_error(backend.as_mut(), "Could not update car", error)
+                    }
+                    Err(error) => {
+                        set_operation_error(backend.as_mut(), "Car operation failed", error.into())
+                    }
+                }
+            });
+        }) {
+            self.as_mut().set_content_busy(false);
+            set_operation_error(self.as_mut(), "Could not update car", error);
         }
     }
 
