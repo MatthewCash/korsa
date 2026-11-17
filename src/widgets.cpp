@@ -317,6 +317,12 @@ private:
         splitter->setStretchFactor(1, 1);
         setCentralWidget(splitter);
         connect(navigation_, &QListWidget::currentRowChanged, stack_, &QStackedWidget::setCurrentIndex);
+        navigation_->item(0)->setToolTip(tr("Open Drive. Ctrl-click to start the selected session."));
+        connect(navigation_, &QListWidget::itemClicked, this, [this](QListWidgetItem *item) {
+            if (navigation_->row(item) == 0 && (QApplication::keyboardModifiers() & Qt::ControlModifier)
+                    && !boolProperty(backend_, "race_running") && driveAction_->isEnabled())
+                launchDrive();
+        });
         navigation_->setCurrentRow(0);
 
         statusLabel_ = new QLabel(tr("Ready"));
